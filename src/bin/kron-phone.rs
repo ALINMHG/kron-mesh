@@ -58,7 +58,7 @@ USAGE
   kron-phone --help
 
 Same Wi‑Fi: two phones `--mine` find each other (UDP beacon on port+1). No PHONE_IP.
-Internet: after listen, dials 144.91.105.244:8000 (override with --bootstrap / KRON_BOOTSTRAP).
+Internet: after listen, retries bootstrap.txt / KRON_BOOTSTRAP (default 144.91.105.244:8000).
   ./kron-phone --mine --reward-address kron1...
   ./kron-phone --mine --reward-address kron1... --no-bootstrap
 
@@ -206,7 +206,7 @@ fn generate_wallet(dir: &Path) -> Result<(), String> {
         let wallet = load_phone_wallet(dir)?;
         println!("[KRON PHONE] wallet already saved in {}", dir.display());
         println!("Address = {}", wallet.address().as_str());
-        println!("Recovery phrase is not printed again. Use --show-mnemonic if you need it.");
+        println!("Recovery phrase is not stored on disk. Write it down when generated.");
         println!("Wallet only — this did not start a node (no P2P listen on :8000).");
         return Ok(());
     }
@@ -228,6 +228,7 @@ fn reveal_mnemonic(dir: &Path) -> Result<(), String> {
     let wallet = load_phone_wallet(dir)?;
     println!("Address = {}", wallet.address().as_str());
     println!("{phrase}");
+    println!("(legacy file only — new wallets do not store the 24 words)");
     Ok(())
 }
 
@@ -364,21 +365,25 @@ fn run_combined_node(
 
     let stop = Arc::new(AtomicBool::new(false));
     let p2p = Arc::new(p2p);
-    let hub_addr = resolve_phone_bootstrap(cli.bootstrap, cli.no_bootstrap, &cli.data_dir)?;
-    if let Some(peer) = hub_addr {
+    let hubs = resolve_phone_bootstrap(cli.bootstrap, cli.no_bootstrap, &cli.data_dir)?;
+    let prefix = if reward.is_some() {
+        "KRON MINER"
+    } else {
+        "KRON NODE"
+    };
+    let mut dial: Vec<SocketAddr> = Vec::new();
+    for peer in hubs {
         if is_self_hub_target(peer, listen_port, None, lan) {
             kron_log(
                 "KRON NODE",
                 format!("skip self-dial {peer} (this process is already listening)"),
             );
         } else {
-            let prefix = if reward.is_some() {
-                "KRON MINER"
-            } else {
-                "KRON NODE"
-            };
-            spawn_hub_dial(p2p.clone(), hub.clone(), peer, stop.clone(), prefix);
+            dial.push(peer);
         }
+    }
+    if !dial.is_empty() {
+        spawn_hub_dial(p2p.clone(), hub.clone(), dial, stop.clone(), prefix);
     }
 
     let explorer_port = cli.explorer_port.unwrap_or(8080);

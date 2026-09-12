@@ -178,7 +178,7 @@ mod tests {
         let mut tx = dag
             .compose_and_sign(&alice, *bob.address().as_bytes(), SEND_AMOUNT)
             .unwrap();
-        tx.relay_nodes.push(*relay.address().as_bytes());
+        tx = crate::dag::relay_intercept_and_sign(tx, &relay);
         dag.attach_and_verify_tx(tx).unwrap();
 
         let subsidy = 50_000u64;
@@ -206,7 +206,7 @@ mod tests {
         let mut tx = dag
             .compose_and_sign(&alice, *bob.address().as_bytes(), SEND_AMOUNT)
             .unwrap();
-        tx.relay_nodes.push(*relay.address().as_bytes());
+        tx = crate::dag::relay_intercept_and_sign(tx, &relay);
         dag.attach_and_verify_tx(tx).unwrap();
 
         assert_eq!(get_current_tx_subsidy(dag.dag_tx_count.saturating_sub(1), HARD_CAP), 0);
@@ -216,6 +216,39 @@ mod tests {
         assert_eq!(dag.balance(relay.address().as_bytes()), 200);
         assert_eq!(dag.relay_credit(relay.address().as_bytes()), 200);
         assert_eq!(dag.balance(bob.address().as_bytes()), SEND_AMOUNT);
+    }
+
+    #[test]
+    fn unsigned_relay_list_does_not_get_twenty_percent() {
+        let (alice, bob, relay) = wallets(0xDA6_0BAD_20);
+        let mut dag = KronDAG::with_genesis();
+        dag.credit_account(*alice.address().as_bytes(), PHONE_CREDIT);
+        let mut tx = dag
+            .compose_and_sign(&alice, *bob.address().as_bytes(), SEND_AMOUNT)
+            .unwrap();
+        tx.relay_nodes.push(*relay.address().as_bytes());
+        assert!(!tx.verify_relay_proofs());
+        assert!(dag.attach_and_verify_tx(tx).is_err());
+        assert_eq!(dag.balance(relay.address().as_bytes()), 0);
+        assert_eq!(dag.relay_credit(relay.address().as_bytes()), 0);
+        assert_eq!(dag.current_supply, 0);
+    }
+
+    #[test]
+    fn sidecar_cannot_change_payouts_after_first_ingest() {
+        let (alice, bob, relay) = wallets(0xDA6_0F12);
+        let mut dag = KronDAG::with_genesis();
+        dag.credit_account(*alice.address().as_bytes(), PHONE_CREDIT);
+        let tx = dag
+            .compose_and_sign(&alice, *bob.address().as_bytes(), SEND_AMOUNT)
+            .unwrap();
+        dag.accept_wire_vertex(tx.clone()).unwrap();
+        let before = dag.balance(relay.address().as_bytes());
+        let mut forged = tx.clone();
+        forged.relay_nodes.push(*relay.address().as_bytes());
+        assert_eq!(dag.accept_wire_vertex(forged).unwrap(), false);
+        assert_eq!(dag.balance(relay.address().as_bytes()), before);
+        assert_eq!(dag.relay_credit(relay.address().as_bytes()), 0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ Phone-only DAG mesh. **Phones mine.** A paid VPS is the public entry (gossip rel
 - Mint: **0.1 KRON** per confirmed tx, **80% miner / 20% relays**
 - Cap: **24,000,000 KRON**, premine **0**
 - Halving: every **126,144,000** confirmed txs
-- Wire: `kron-mesh/1` (`SyncInventory` / Have / Need / `DagTransaction`)
+- Wire: `kron-mesh/1` Have/Need / `DagTransaction` **inside Noise XX** (cleartext `KRMS` on :8000 is rejected)
 
 Same Wi‑Fi phones auto-find each other (LAN UDP beacon). Different networks join via the VPS. x86 mining is refused at runtime. The VPS **never mines**.
 
@@ -75,7 +75,7 @@ cargo build --release -p new-blockchain
 ./target/release/kron-phone --mine --reward-address kron1...
 ```
 
-No `--bootstrap` is required. After local listen the miner dials **144.91.105.244:8000**. Success:
+No `--bootstrap` is required. After local listen the miner retries the bootstrap list (default **144.91.105.244:8000**; extra `host:port` lines in `bootstrap.txt` / `KRON_BOOTSTRAP`). Success:
 
 ```
 [KRON MINER] connecting to hub 144.91.105.244:8000 ...
@@ -188,7 +188,7 @@ The miner dials `144.91.105.244:8000` after listen. Override with `--bootstrap h
 
 No flags opens a menu:
 
-1. **Generate KRON address** — prints a `kron1...` address and a **24-word** passphrase. Wallet only: it does **not** bind `:8000`. Write the words down; they are not shown again (use `--show-mnemonic` only if you must).
+1. **Generate KRON address** — prints a `kron1...` address and a **24-word** passphrase **once**. The phrase is **not** written to disk. Optional `KRON_WALLET_PASS` XOR-obscures `wallet.seed` (chmod 600). Wallet only: it does **not** bind `:8000`.
 2. **Mine** — prompts for a `kron1` reward address (paste the address only; whitespace/newlines are trimmed). The node stays running in the **same process** and binds P2P once, then dials the VPS. `--no-discovery` only disables LAN beacons. `--no-bootstrap` stays LAN-only.
 
 Flags (all three mine forms are equivalent):
@@ -227,7 +227,7 @@ Other commands:
 
 `credit` is a local faucet on that phone’s data-dir. It is **not** minted supply.
 
-Default data-dir for `kron-phone` is `./kron-phone` (wallet seed, mnemonic, DAG WAL).
+Default data-dir for `kron-phone` is `./kron-phone` (wallet seed + DAG WAL; no `wallet.mnemonic` file).
 
 ## Unique mesh ID, not a public IP
 
@@ -314,22 +314,25 @@ If error 98 (`Address already in use`), stop the leftover process: `pkill -f kro
 | `kron-phone-miner` | `./kron-phone-miner` |
 | `kron-node` | `%APPDATA%\KRON\gateway-<port>` (Windows); `/var/lib/kron` on the VPS if you pass it |
 
-Secrets written there: `wallet.seed`, `wallet.mnemonic`, `identity.seed`. Do not copy them into git.
+Secrets written there: `wallet.seed`, `identity.seed` (chmod 600). The 24-word phrase is shown once and is not stored. Do not copy secrets into git.
 
 Bootstrap config (no SSH, no passwords in this repo):
 
 | Source | Example |
 | --- | --- |
 | Default | `144.91.105.244:8000` |
-| Env | `KRON_BOOTSTRAP=144.91.105.244:8000` |
-| File | `bootstrap.txt` (repo copy already has the VPS) |
+| Env | `KRON_BOOTSTRAP=144.91.105.244:8000` (comma/newline list OK) |
+| File | `bootstrap.txt` — one `host:port` per line (starts with the VPS; add a second hub later) |
 | CLI | `--bootstrap 144.91.105.244:8000` |
 
 ## Security
 
-- Write the **24-word** phrase on paper. Do not screenshot it or share it.
-- Do not commit `wallet.json`, `identity.seed`, `wallet.seed`, `wallet.mnemonic`, `.env`, or AppData copies.
+- Write the **24-word** phrase on paper. It is not stored on disk. Do not screenshot it or share it.
+- Optional: `KRON_WALLET_PASS` XOR-obscures `wallet.seed`.
+- Do not commit `wallet.json`, `identity.seed`, `wallet.seed`, `.env`, or AppData copies.
 - Anyone with the phrase can spend the `kron1` address.
+- Ledger sync and wallet submit require Noise XX + Dilithium. Cleartext `KRMS` is dropped.
+- Faucet / first-share dust is local-only and is **not** minted supply (explorer shows subsidy only).
 - Mining requires a real phone ARM profile. x86 hosts cannot mine. `kron-node` on the VPS (no `--follow`) is a relay only.
 
 ## Conflict rule

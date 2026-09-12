@@ -71,7 +71,7 @@
     <div class="card"><label>Vertices</label><div class="v" id="st-vertices">—</div></div>
     <div class="card"><label>Tips</label><div class="v" id="st-tips">—</div></div>
     <div class="card"><label>Confirmed txs</label><div class="v" id="st-txs">—</div></div>
-    <div class="card"><label>Circulating</label><div class="v" id="st-supply">—</div><div class="s" id="st-cap"></div></div>
+    <div class="card"><label>Minted supply</label><div class="v" id="st-supply">—</div><div class="s" id="st-cap"></div></div>
     <div class="card"><label>Hub</label><div class="v" id="st-hub">144.91.105.244:8000</div><div class="s" id="st-explorer">http://144.91.105.244:8080</div></div>
   </div>
 
@@ -130,7 +130,7 @@ async function refresh() {
     document.getElementById('st-tips').textContent = stats.tip_count;
     document.getElementById('st-txs').textContent = stats.dag_tx_count;
     document.getElementById('st-supply').textContent = stats.circulating_kron + ' ' + (meta.ticker || 'KRON');
-    document.getElementById('st-cap').textContent = 'hard cap ' + stats.hard_cap_kron + ' ' + (meta.ticker || 'KRON');
+    document.getElementById('st-cap').textContent = 'minted subsidy only (not faucet) · hard cap ' + stats.hard_cap_kron + ' ' + (meta.ticker || 'KRON');
     document.getElementById('st-hub').textContent = stats.hub || meta.hub || '144.91.105.244:8000';
     document.getElementById('st-explorer').textContent = stats.explorer_url || meta.explorer_url || 'http://144.91.105.244:8080';
     document.getElementById('vertices').innerHTML = vertexTable(verts);

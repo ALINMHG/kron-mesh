@@ -141,8 +141,14 @@ impl DagStore {
             if dag.contains(&rec.tx.id) {
                 continue;
             }
-            dag.attach_and_verify_tx(rec.tx)?;
+            // Conflict / orphan spends must not crash boot: same path as live ingest.
+            match dag.accept_wire_vertex(rec.tx) {
+                Ok(_) => {}
+                Err(DagError::UnknownParent(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
+        dag.resolve_conflicts_and_rebuild_ledger()?;
         Ok((dag, snap))
     }
 
@@ -381,6 +387,55 @@ mod tests {
         assert_eq!(dag2.contains(&tx.id), true);
         assert_eq!(dag2.tip_list(), tips);
         assert_eq!(snap.supply, supply);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wal_conflicting_spends_restart_one_winner() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0F1);
+        let alice = generate_kron_wallet_from_rng(&mut rng);
+        let bob = generate_kron_wallet_from_rng(&mut rng);
+        let carol = generate_kron_wallet_from_rng(&mut rng);
+        let dir = std::env::temp_dir().join(format!(
+            "kron-dag-wal-conflict-{}-{}",
+            std::process::id(),
+            0xC0F1
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = DagStore::open(&dir).unwrap();
+        let mut dag = KronDAG::with_genesis();
+        let mut faucet = BTreeMap::new();
+        faucet.insert(*alice.address().as_bytes(), 1_000_000);
+        dag.credit_account(*alice.address().as_bytes(), 1_000_000);
+        let tx_bob = dag
+            .compose_and_sign_with_rng(&alice, *bob.address().as_bytes(), 10_000, &mut rng)
+            .unwrap();
+        dag.attach_and_verify_tx(tx_bob.clone()).unwrap();
+        let (p1, p2) = dag.select_parents_with_rng(&mut rng);
+        let tx_carol = crate::dag::DagTransaction::user_transfer(
+            p1,
+            p2,
+            &alice,
+            *carol.address().as_bytes(),
+            10_000,
+            0,
+        )
+        .unwrap();
+        dag.accept_wire_vertex(tx_carol.clone()).unwrap();
+        store.append_vertex(&tx_bob, &dag).unwrap();
+        store.append_vertex(&tx_carol, &dag).unwrap();
+        store
+            .write_snapshot(&DagSnapshot::from_dag_with_faucet(&dag, faucet))
+            .unwrap();
+        drop(store);
+
+        let store2 = DagStore::open(&dir).unwrap();
+        let (dag2, _) = store2.load().expect("WAL replay must not crash on conflicts");
+        assert!(dag2.contains(&tx_bob.id) && dag2.contains(&tx_carol.id));
+        assert!(dag2.is_conflict(&tx_bob.id) ^ dag2.is_conflict(&tx_carol.id));
+        let winners = usize::from(!dag2.is_conflict(&tx_bob.id))
+            + usize::from(!dag2.is_conflict(&tx_carol.id));
+        assert_eq!(winners, 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }

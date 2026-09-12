@@ -98,8 +98,9 @@ pub fn run_active_miner_loop(
     })
 }
 
-/// One miner tick: genesis if empty, dust faucet on a genesis-only DAG, then
-/// compose + attach. Returns immediately — callers must not treat this as a
+/// One miner tick: genesis if empty, then compose + attach.
+/// First-share dust on a genesis-only DAG is **local-only** (not gossiped,
+/// not minted supply). Returns immediately — callers must not treat this as a
 /// blocking accept loop.
 pub fn miner_tick(
     wallet: &KronKeypair,

@@ -1,19 +1,24 @@
 //! Versioned KRON Mesh wire protocol (`kron-mesh/1`).
 //!
-//! Length-prefixed TCP frames (magic `KRMS`). Not a shared [`KronDAG`]: peers
-//! exchange [`SyncInventory`], Have/Need hashes, and [`DagTransaction`] bodies.
-//! Noise gossip (`NBCH` inside Noise) stays on the same listen port; the
-//! accept loop peeks the first four bytes and dispatches here when it sees
-//! `KRMS`.
+//! Authenticated `kron-mesh/1` over Noise XX ( Dilithium identity after handshake).
+//! Peers exchange [`SyncInventory`], Have/Need hashes, and [`DagTransaction`]
+//! bodies as `KIND_MESH` frames inside the Noise session. Cleartext `KRMS` on
+//! port 8000 is rejected. Faucet maps are never advertised.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::dag::{compute_dag_diff, DagTransaction, KronDAG, SyncInventory, TxHash};
+use crate::anti_bot::profile::DeviceClass;
+use crate::crypto::lattice::LatticeKeyPair;
+use crate::dag::{compute_dag_diff, DagTransaction, KronDAG, SyncInventory, TxHash, MAX_INVENTORY_HASHES};
 use crate::p2p::error::NetworkError;
-use crate::p2p::frame::{configure_socket, MAX_FRAME};
+use crate::p2p::frame::{KIND_MESH, MAX_FRAME};
+use crate::p2p::handshake::{perform_secure_handshake, HandshakeConfig};
+use crate::p2p::noise::NoiseSession;
+use crate::p2p::peer::PeerRole;
 /// Protocol name advertised in Hello / Ping.
 pub const PROTOCOL_KRON_MESH: &str = "kron-mesh/1";
 pub const MESH_MAGIC: &[u8; 4] = b"KRMS";
@@ -27,6 +32,12 @@ pub const MK_HAVE: u8 = 11;
 pub const MK_NEED: u8 = 12;
 pub const MK_DAG_TX: u8 = 13;
 pub const MK_DONE: u8 = 14;
+
+/// Max inbound mesh sessions on one hub (plus the accept loop).
+pub const MAX_MESH_CONNECTIONS: usize = 64;
+/// New vertices accepted from one peer per rate window.
+pub const MAX_VERTICES_PER_PEER_WINDOW: u32 = 32;
+const VERTEX_RATE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Role on the mesh wire (hub replica, wallet submit, or in-process test).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +83,15 @@ pub trait MeshGraph: Send + Sync {
     fn apply_inventory(&self, inv: &SyncInventory);
     fn need_and_have(&self, remote: &SyncInventory) -> (Vec<TxHash>, Vec<TxHash>);
     fn vertex_set(&self) -> std::collections::HashSet<TxHash>;
+    /// Hub connection slot. Isolated test DAGs always admit.
+    fn try_acquire_session(&self) -> bool {
+        true
+    }
+    fn release_session(&self) {}
+    /// Per-peer vertex rate limit. Isolated test DAGs always admit.
+    fn allow_new_vertex(&self) -> bool {
+        true
+    }
 }
 
 /// One process-local graph. Tests construct two of these — never one `Arc`.
@@ -119,11 +139,8 @@ impl MeshGraph for IsolatedDag {
         self.lock_dag().transactions_for_in_order(ids)
     }
 
-    fn apply_inventory(&self, inv: &SyncInventory) {
-        let mut dag = self.lock_dag();
-        for (addr, amount) in &inv.faucet {
-            dag.apply_faucet_hint(*addr, *amount);
-        }
+    fn apply_inventory(&self, _inv: &SyncInventory) {
+        // Faucet maps are not on the wire and must not credit spendable balances.
     }
 
     fn need_and_have(&self, remote: &SyncInventory) -> (Vec<TxHash>, Vec<TxHash>) {
@@ -140,6 +157,9 @@ pub struct HubState {
     dag: Mutex<KronDAG>,
     store: Mutex<Option<crate::persist::DagStore>>,
     api: Arc<Mutex<crate::explorer::ExplorerApi>>,
+    sessions: AtomicUsize,
+    vertex_window_start: Mutex<Instant>,
+    vertices_in_window: AtomicU32,
 }
 
 impl HubState {
@@ -148,6 +168,9 @@ impl HubState {
             dag: Mutex::new(dag),
             store: Mutex::new(None),
             api: Arc::new(Mutex::new(crate::explorer::ExplorerApi::new())),
+            sessions: AtomicUsize::new(0),
+            vertex_window_start: Mutex::new(Instant::now()),
+            vertices_in_window: AtomicU32::new(0),
         })
     }
 
@@ -232,18 +255,8 @@ impl MeshGraph for HubState {
         self.lock_dag().transactions_for_in_order(ids)
     }
 
-    fn apply_inventory(&self, inv: &SyncInventory) {
-        let mut dag = self.lock_dag();
-        for (addr, amount) in &inv.faucet {
-            dag.apply_faucet_hint(*addr, *amount);
-        }
-        let faucet = dag.faucet_snapshot();
-        if let Some(store) = self.store.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            let _ = store.write_snapshot(&crate::persist::DagSnapshot::from_dag_with_faucet(
-                &dag, faucet,
-            ));
-        }
-        self.api().sync_from_dag(&dag);
+    fn apply_inventory(&self, _inv: &SyncInventory) {
+        // Peer inventories never credit faucet / spendable balances.
     }
 
     fn need_and_have(&self, remote: &SyncInventory) -> (Vec<TxHash>, Vec<TxHash>) {
@@ -252,6 +265,34 @@ impl MeshGraph for HubState {
 
     fn vertex_set(&self) -> std::collections::HashSet<TxHash> {
         self.lock_dag().vertex_set()
+    }
+
+    fn try_acquire_session(&self) -> bool {
+        let n = self.sessions.fetch_add(1, Ordering::SeqCst);
+        if n >= MAX_MESH_CONNECTIONS {
+            self.sessions.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    fn release_session(&self) {
+        let _ = self.sessions.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(1))
+        });
+    }
+
+    fn allow_new_vertex(&self) -> bool {
+        let mut start = self
+            .vertex_window_start
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if start.elapsed() >= VERTEX_RATE_WINDOW {
+            *start = Instant::now();
+            self.vertices_in_window.store(0, Ordering::SeqCst);
+        }
+        let n = self.vertices_in_window.fetch_add(1, Ordering::SeqCst);
+        n < MAX_VERTICES_PER_PEER_WINDOW
     }
 }
 
@@ -366,6 +407,9 @@ fn decode_hash_list(bytes: &[u8]) -> Result<Vec<TxHash>, NetworkError> {
         return Err(NetworkError::BadFrame);
     }
     let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if n > MAX_INVENTORY_HASHES {
+        return Err(NetworkError::BadFrame);
+    }
     if bytes.len() != 4 + n * 32 {
         return Err(NetworkError::BadFrame);
     }
@@ -388,11 +432,6 @@ fn encode_sync_inventory(inv: &SyncInventory) -> Vec<u8> {
         }
         None => out.push(0),
     }
-    out.extend_from_slice(&(inv.faucet.len() as u32).to_le_bytes());
-    for (addr, amount) in &inv.faucet {
-        out.extend_from_slice(addr);
-        out.extend_from_slice(&amount.to_le_bytes());
-    }
     out
 }
 
@@ -401,6 +440,9 @@ fn decode_sync_inventory(bytes: &[u8]) -> Result<SyncInventory, NetworkError> {
         return Err(NetworkError::BadFrame);
     }
     let nt = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if nt > MAX_INVENTORY_HASHES {
+        return Err(NetworkError::BadFrame);
+    }
     let mut off = 4;
     if bytes.len() < off + nt * 32 + 4 {
         return Err(NetworkError::BadFrame);
@@ -413,6 +455,9 @@ fn decode_sync_inventory(bytes: &[u8]) -> Result<SyncInventory, NetworkError> {
         off += 32;
     }
     let nr = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+    if nr > MAX_INVENTORY_HASHES || nt.saturating_add(nr) > MAX_INVENTORY_HASHES {
+        return Err(NetworkError::BadFrame);
+    }
     off += 4;
     if bytes.len() < off + nr * 32 + 1 {
         return Err(NetworkError::BadFrame);
@@ -439,44 +484,33 @@ fn decode_sync_inventory(bytes: &[u8]) -> Result<SyncInventory, NetworkError> {
     } else {
         return Err(NetworkError::BadFrame);
     };
-    if bytes.len() < off + 4 {
-        return Err(NetworkError::BadFrame);
-    }
-    let nf = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-    off += 4;
-    if bytes.len() < off + nf * 40 {
-        return Err(NetworkError::BadFrame);
-    }
-    let mut faucet = Vec::with_capacity(nf);
-    for _ in 0..nf {
-        let mut addr = [0u8; 32];
-        addr.copy_from_slice(&bytes[off..off + 32]);
-        off += 32;
-        let amount = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        off += 8;
-        faucet.push((addr, amount));
-    }
+    // Legacy peers may still append a faucet map. Never apply it.
     let _ = off;
     Ok(SyncInventory {
         tips,
         recent,
         peer_id,
-        faucet,
     })
 }
 
-fn write_msg(stream: &mut TcpStream, msg: &MeshWireMessage) -> Result<(), NetworkError> {
+fn write_msg(session: &mut NoiseSession, msg: &MeshWireMessage) -> Result<(), NetworkError> {
     let (kind, payload) = encode_wire(msg);
-    write_mesh_frame(stream, kind, &payload)
+    let mut body = Vec::with_capacity(1 + payload.len());
+    body.push(kind);
+    body.extend_from_slice(&payload);
+    session.write_frame(KIND_MESH, &body)
 }
 
-fn read_msg(stream: &mut TcpStream) -> Result<MeshWireMessage, NetworkError> {
-    let (kind, payload) = read_mesh_frame(stream)?;
-    decode_wire(kind, &payload)
+fn read_msg(session: &mut NoiseSession) -> Result<MeshWireMessage, NetworkError> {
+    let (kind, payload) = session.read_frame()?;
+    if kind != KIND_MESH || payload.is_empty() {
+        return Err(NetworkError::BadFrame);
+    }
+    decode_wire(payload[0], &payload[1..])
 }
 
-fn expect_hello(stream: &mut TcpStream) -> Result<MeshRole, NetworkError> {
-    match read_msg(stream)? {
+fn expect_hello(session: &mut NoiseSession) -> Result<MeshRole, NetworkError> {
+    match read_msg(session)? {
         MeshWireMessage::Hello { protocol, role } => {
             if protocol != PROTOCOL_KRON_MESH {
                 return Err(NetworkError::Handshake("wrong mesh protocol"));
@@ -487,9 +521,9 @@ fn expect_hello(stream: &mut TcpStream) -> Result<MeshRole, NetworkError> {
     }
 }
 
-fn send_hello(stream: &mut TcpStream, role: MeshRole) -> Result<(), NetworkError> {
+fn send_hello(session: &mut NoiseSession, role: MeshRole) -> Result<(), NetworkError> {
     write_msg(
-        stream,
+        session,
         &MeshWireMessage::Hello {
             protocol: PROTOCOL_KRON_MESH.to_string(),
             role,
@@ -497,35 +531,106 @@ fn send_hello(stream: &mut TcpStream, role: MeshRole) -> Result<(), NetworkError
     )
 }
 
-/// Serve one inbound `kron-mesh/1` session (hub sync or wallet submit).
-pub fn serve_mesh_session(mut stream: TcpStream, graph: Arc<dyn MeshGraph>) {
-    if configure_socket(&mut stream).is_err() {
+fn ephemeral_hs(initiator: bool) -> HandshakeConfig {
+    let mut rng = rand::rngs::OsRng;
+    HandshakeConfig::honest(
+        LatticeKeyPair::generate(&mut rng),
+        if initiator {
+            PeerRole::EdgeMiner
+        } else {
+            PeerRole::CoreValidator
+        },
+        if initiator {
+            DeviceClass::LegacyMobile
+        } else {
+            DeviceClass::PersonalComputer
+        },
+        initiator,
+    )
+}
+
+/// Serve mesh after Noise XX + Dilithium. Cleartext `KRMS` callers must not reach here.
+pub fn serve_authenticated_mesh(session: &mut NoiseSession, graph: Arc<dyn MeshGraph>) {
+    if !graph.try_acquire_session() {
         return;
     }
-    let role = match expect_hello(&mut stream) {
+    let _guard = SessionGuard(graph.clone());
+    let role = match expect_hello(session) {
         Ok(r) => r,
         Err(_) => return,
     };
-    if send_hello(&mut stream, MeshRole::Hub).is_err() {
+    finish_authenticated_mesh(session, graph.as_ref(), role);
+}
+
+/// Hub inbound already consumed the first `KIND_MESH` frame (mesh Hello).
+pub fn serve_authenticated_mesh_from_first(
+    mut session: NoiseSession,
+    graph: Arc<dyn MeshGraph>,
+    first_payload: Vec<u8>,
+) {
+    if !graph.try_acquire_session() {
+        return;
+    }
+    let _guard = SessionGuard(graph.clone());
+    if first_payload.is_empty() {
+        return;
+    }
+    let first = match decode_wire(first_payload[0], &first_payload[1..]) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let role = match first {
+        MeshWireMessage::Hello { protocol, role } if protocol == PROTOCOL_KRON_MESH => role,
+        _ => return,
+    };
+    finish_authenticated_mesh(&mut session, graph.as_ref(), role);
+}
+
+fn finish_authenticated_mesh(session: &mut NoiseSession, graph: &dyn MeshGraph, role: MeshRole) {
+    if send_hello(session, MeshRole::Hub).is_err() {
         return;
     }
     match role {
         MeshRole::Wallet => {
-            let _ = serve_wallet_submit(&mut stream, graph.as_ref());
+            let _ = serve_wallet_submit(session, graph);
         }
         MeshRole::Hub | MeshRole::Test => {
-            let _ = run_sync_round(&mut stream, graph.as_ref(), false);
+            let _ = run_sync_round(session, graph, false);
         }
     }
 }
 
-fn serve_wallet_submit(stream: &mut TcpStream, graph: &dyn MeshGraph) -> Result<(), NetworkError> {
+struct SessionGuard(Arc<dyn MeshGraph>);
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.release_session();
+    }
+}
+
+/// Inbound after Noise + Dilithium (production hub).
+pub fn serve_mesh_session(stream: TcpStream, graph: Arc<dyn MeshGraph>) {
+    let hs = ephemeral_hs(false);
+    let mut session = match NoiseSession::handshake(stream, false) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if perform_secure_handshake(&mut session, &hs).is_err() {
+        session.shutdown();
+        return;
+    }
+    serve_authenticated_mesh(&mut session, graph);
+}
+
+fn serve_wallet_submit(session: &mut NoiseSession, graph: &dyn MeshGraph) -> Result<(), NetworkError> {
     loop {
-        match read_msg(stream)? {
-            MeshWireMessage::Ping => write_msg(stream, &MeshWireMessage::Pong)?,
+        match read_msg(session)? {
+            MeshWireMessage::Ping => write_msg(session, &MeshWireMessage::Pong)?,
             MeshWireMessage::DagTransaction(tx) => {
+                if !graph.allow_new_vertex() {
+                    return Err(NetworkError::BadFrame);
+                }
                 graph.ingest(tx).map_err(|_| NetworkError::BadFrame)?;
-                write_msg(stream, &MeshWireMessage::Done)?;
+                write_msg(session, &MeshWireMessage::Done)?;
                 return Ok(());
             }
             MeshWireMessage::Done => return Ok(()),
@@ -536,50 +641,50 @@ fn serve_wallet_submit(stream: &mut TcpStream, graph: &dyn MeshGraph) -> Result<
 
 /// Lockstep Have/Need + body exchange. `initiator` is the connecting peer.
 pub fn run_sync_round(
-    stream: &mut TcpStream,
+    session: &mut NoiseSession,
     graph: &dyn MeshGraph,
     initiator: bool,
 ) -> Result<(), NetworkError> {
     if initiator {
-        write_msg(stream, &MeshWireMessage::Ping)?;
-        match read_msg(stream)? {
+        write_msg(session, &MeshWireMessage::Ping)?;
+        match read_msg(session)? {
             MeshWireMessage::Pong | MeshWireMessage::Ping => {}
             _ => return Err(NetworkError::Handshake("expected mesh pong")),
         }
-        write_msg(stream, &MeshWireMessage::SyncInventory(graph.inventory()))?;
-        let remote = match read_msg(stream)? {
+        write_msg(session, &MeshWireMessage::SyncInventory(graph.inventory()))?;
+        let remote = match read_msg(session)? {
             MeshWireMessage::SyncInventory(inv) => inv,
             _ => return Err(NetworkError::BadFrame),
         };
         graph.apply_inventory(&remote);
         let (need, have) = graph.need_and_have(&remote);
-        write_msg(stream, &MeshWireMessage::Need { ids: need })?;
-        write_msg(stream, &MeshWireMessage::Have { ids: have })?;
-        let their_need = match read_msg(stream)? {
+        write_msg(session, &MeshWireMessage::Need { ids: need })?;
+        write_msg(session, &MeshWireMessage::Have { ids: have })?;
+        let their_need = match read_msg(session)? {
             MeshWireMessage::Need { ids } => ids,
             _ => return Err(NetworkError::BadFrame),
         };
         for tx in graph.bodies_in_order(&their_need) {
-            write_msg(stream, &MeshWireMessage::DagTransaction(tx))?;
+            write_msg(session, &MeshWireMessage::DagTransaction(tx))?;
         }
-        write_msg(stream, &MeshWireMessage::Done)?;
-        recv_bodies_until_done(stream, graph)
+        write_msg(session, &MeshWireMessage::Done)?;
+        recv_bodies_until_done(session, graph)
     } else {
-        match read_msg(stream)? {
-            MeshWireMessage::Ping => write_msg(stream, &MeshWireMessage::Pong)?,
-            other => return unexpected_as_inv(stream, graph, other),
+        match read_msg(session)? {
+            MeshWireMessage::Ping => write_msg(session, &MeshWireMessage::Pong)?,
+            other => return unexpected_as_inv(session, graph, other),
         }
-        let remote = match read_msg(stream)? {
+        let remote = match read_msg(session)? {
             MeshWireMessage::SyncInventory(inv) => inv,
             _ => return Err(NetworkError::BadFrame),
         };
         graph.apply_inventory(&remote);
-        write_msg(stream, &MeshWireMessage::SyncInventory(graph.inventory()))?;
-        let their_need = match read_msg(stream)? {
+        write_msg(session, &MeshWireMessage::SyncInventory(graph.inventory()))?;
+        let their_need = match read_msg(session)? {
             MeshWireMessage::Need { ids } => ids,
             _ => return Err(NetworkError::BadFrame),
         };
-        let their_have = match read_msg(stream)? {
+        let their_have = match read_msg(session)? {
             MeshWireMessage::Have { ids } => ids,
             _ => return Err(NetworkError::BadFrame),
         };
@@ -589,19 +694,17 @@ pub fn run_sync_round(
                 need.push(id);
             }
         }
-        write_msg(stream, &MeshWireMessage::Need { ids: need })?;
+        write_msg(session, &MeshWireMessage::Need { ids: need })?;
         for tx in graph.bodies_in_order(&their_need) {
-            write_msg(stream, &MeshWireMessage::DagTransaction(tx))?;
+            write_msg(session, &MeshWireMessage::DagTransaction(tx))?;
         }
-        // Recv phone vertices before Done. A premature Done lets the miner
-        // drop the socket (TCP RST) and the hub never merges inbound shares.
-        recv_bodies_until_done(stream, graph)?;
-        write_msg(stream, &MeshWireMessage::Done)
+        recv_bodies_until_done(session, graph)?;
+        write_msg(session, &MeshWireMessage::Done)
     }
 }
 
 fn unexpected_as_inv(
-    stream: &mut TcpStream,
+    session: &mut NoiseSession,
     graph: &dyn MeshGraph,
     first: MeshWireMessage,
 ) -> Result<(), NetworkError> {
@@ -609,31 +712,36 @@ fn unexpected_as_inv(
         return Err(NetworkError::BadFrame);
     };
     graph.apply_inventory(&remote);
-    write_msg(stream, &MeshWireMessage::SyncInventory(graph.inventory()))?;
+    write_msg(session, &MeshWireMessage::SyncInventory(graph.inventory()))?;
     let (need, _) = graph.need_and_have(&remote);
-    write_msg(stream, &MeshWireMessage::Need { ids: need })?;
-    recv_bodies_until_done(stream, graph)
+    write_msg(session, &MeshWireMessage::Need { ids: need })?;
+    recv_bodies_until_done(session, graph)
 }
 
-fn recv_bodies_until_done(stream: &mut TcpStream, graph: &dyn MeshGraph) -> Result<(), NetworkError> {
+fn recv_bodies_until_done(
+    session: &mut NoiseSession,
+    graph: &dyn MeshGraph,
+) -> Result<(), NetworkError> {
     loop {
-        match read_msg(stream) {
+        match read_msg(session) {
             Ok(MeshWireMessage::DagTransaction(tx)) => {
-                let _ = graph.ingest(tx);
+                if graph.allow_new_vertex() {
+                    let _ = graph.ingest(tx);
+                }
             }
             Ok(MeshWireMessage::Need { ids }) => {
                 for tx in graph.bodies_in_order(&ids) {
-                    write_msg(stream, &MeshWireMessage::DagTransaction(tx))?;
+                    write_msg(session, &MeshWireMessage::DagTransaction(tx))?;
                 }
             }
             Ok(MeshWireMessage::Have { ids }) => {
                 let missing: Vec<TxHash> = ids.into_iter().filter(|id| !graph.contains(id)).collect();
                 if !missing.is_empty() {
-                    write_msg(stream, &MeshWireMessage::Need { ids: missing })?;
+                    write_msg(session, &MeshWireMessage::Need { ids: missing })?;
                 }
             }
             Ok(MeshWireMessage::Done) => return Ok(()),
-            Ok(MeshWireMessage::Ping) => write_msg(stream, &MeshWireMessage::Pong)?,
+            Ok(MeshWireMessage::Ping) => write_msg(session, &MeshWireMessage::Pong)?,
             Ok(MeshWireMessage::Pong) => {}
             Ok(_) => return Err(NetworkError::BadFrame),
             Err(NetworkError::Io(e))
@@ -647,33 +755,39 @@ fn recv_bodies_until_done(stream: &mut TcpStream, graph: &dyn MeshGraph) -> Resu
     }
 }
 
-/// Connect to a hub, hello, exchange vertices. Used by a second gateway and tests.
+fn open_mesh_client(addr: SocketAddr) -> Result<NoiseSession, NetworkError> {
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    let mut session = NoiseSession::handshake(stream, true)?;
+    let hs = ephemeral_hs(true);
+    perform_secure_handshake(&mut session, &hs)?;
+    Ok(session)
+}
+
+/// Connect to a hub: Noise XX + Dilithium, then Have/Need inside the session.
 pub fn mesh_sync_connect(
     addr: SocketAddr,
     graph: Arc<dyn MeshGraph>,
     role: MeshRole,
 ) -> Result<(), NetworkError> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-    configure_socket(&mut stream)?;
-    send_hello(&mut stream, role)?;
-    let _ = expect_hello(&mut stream)?;
-    run_sync_round(&mut stream, graph.as_ref(), true)
+    let mut session = open_mesh_client(addr)?;
+    send_hello(&mut session, role)?;
+    let _ = expect_hello(&mut session)?;
+    run_sync_round(&mut session, graph.as_ref(), true)
 }
 
-/// Wallet broadcast: send a signed vertex to `127.0.0.1:8000` (or `KRON_GATEWAY`).
+/// Wallet broadcast: Noise + Dilithium, then a signed vertex (or `KRON_GATEWAY`).
 pub fn broadcast_wallet_tx(addr: SocketAddr, tx: &DagTransaction) -> Result<(), NetworkError> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-    configure_socket(&mut stream)?;
-    send_hello(&mut stream, MeshRole::Wallet)?;
-    let _ = expect_hello(&mut stream)?;
-    write_msg(&mut stream, &MeshWireMessage::DagTransaction(tx.clone()))?;
-    match read_msg(&mut stream)? {
+    let mut session = open_mesh_client(addr)?;
+    send_hello(&mut session, MeshRole::Wallet)?;
+    let _ = expect_hello(&mut session)?;
+    write_msg(&mut session, &MeshWireMessage::DagTransaction(tx.clone()))?;
+    match read_msg(&mut session)? {
         MeshWireMessage::Done => Ok(()),
         _ => Err(NetworkError::BadFrame),
     }
 }
 
-/// Bind a mesh-only listener (tests). Production hubs share `--port` with Noise.
+/// Bind a Noise-authenticated mesh listener (tests). Production hubs share `--port`.
 pub fn bind_mesh_listener(
     graph: Arc<dyn MeshGraph>,
 ) -> Result<(SocketAddr, std::thread::JoinHandle<()>), NetworkError> {
@@ -690,6 +804,15 @@ pub fn bind_mesh_listener(
         .map_err(NetworkError::Io)?;
     std::thread::sleep(Duration::from_millis(20));
     Ok((addr, handle))
+}
+
+/// True when the first four peekable bytes are cleartext `KRMS`.
+pub fn peek_is_cleartext_krms(stream: &TcpStream) -> bool {
+    let mut got = [0u8; 4];
+    match stream.peek(&mut got) {
+        Ok(n) if n >= 4 => got == *MESH_MAGIC,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -752,5 +875,36 @@ mod tests {
             "after sync both isolated DAGs must store the same vertices"
         );
         assert!(graph_b.contains(&tx.id));
+    }
+
+    #[test]
+    fn peer_faucet_hint_does_not_increase_receiver_balance() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xF4C7);
+        let alice = generate_kron_wallet_from_rng(&mut rng);
+        let addr = *alice.address().as_bytes();
+        let mut sender = KronDAG::with_genesis();
+        sender.credit_account(addr, 5_000_000);
+        let receiver = IsolatedDag::new(KronDAG::with_genesis());
+        assert_eq!(receiver.lock_dag().balance(&addr), 0);
+        receiver.lock_dag().apply_faucet_hint(addr, 5_000_000);
+        assert_eq!(receiver.lock_dag().balance(&addr), 0);
+        let inv = SyncInventory::from_dag(&sender, [1u8; 32]);
+        receiver.apply_inventory(&inv);
+        assert_eq!(receiver.lock_dag().balance(&addr), 0);
+        assert!(inv.tips.len() + inv.recent.len() <= MAX_INVENTORY_HASHES);
+    }
+
+    #[test]
+    fn oversized_inventory_is_rejected() {
+        let n = MAX_INVENTORY_HASHES + 1;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(n as u32).to_le_bytes());
+        payload.extend(std::iter::repeat(0u8).take(n * 32));
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.push(0);
+        assert!(decode_sync_inventory(&payload).is_err());
+        let mut ids = Vec::new();
+        ids.extend(std::iter::repeat([0u8; 32]).take(n));
+        assert!(decode_hash_list(&encode_hash_list(&ids)).is_err());
     }
 }

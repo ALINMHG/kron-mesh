@@ -15,15 +15,17 @@ use crate::types::Address;
 use super::engine::KronDAG;
 use super::tx::{TxHash, NULL_PARENT};
 
+/// Hard cap on advertised tip + recent hashes (DoS bound).
+pub const MAX_INVENTORY_HASHES: usize = 4_096;
+
 /// Compact advertisement of a phone's DAG frontier.
+/// Faucet / bootstrap credits are never advertised: they are local-only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncInventory {
     pub tips: Vec<TxHash>,
     /// Optional recent hashes (tip parent-closures, genesis omitted).
     pub recent: Vec<TxHash>,
     pub peer_id: Option<Address>,
-    /// Faucet credits (not minted supply) so a replica can apply spends.
-    pub faucet: Vec<(Address, u64)>,
 }
 
 impl SyncInventory {
@@ -32,7 +34,6 @@ impl SyncInventory {
             tips,
             recent: Vec::new(),
             peer_id: None,
-            faucet: Vec::new(),
         }
     }
 
@@ -59,7 +60,6 @@ impl SyncInventory {
             tips,
             recent,
             peer_id: Some(peer_id),
-            faucet: dag.faucet_snapshot().into_iter().collect(),
         }
     }
 

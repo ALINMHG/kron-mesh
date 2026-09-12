@@ -85,4 +85,19 @@ mod tests {
         assert_eq!(meta.name, "KRON Network");
         assert_eq!(get_kron_asset_metadata().ticker, "KRON");
     }
+
+    #[test]
+    fn explorer_does_not_count_faucet_as_minted_supply() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xF4CE);
+        let alice = generate_kron_wallet_from_rng(&mut rng);
+        let mut dag = KronDAG::with_genesis();
+        dag.credit_account(*alice.address().as_bytes(), 9_000_000);
+        let mut api = ExplorerApi::new();
+        api.sync_from_dag(&dag);
+        assert_eq!(api.get_network_stats().circulating_supply, 0);
+        assert_eq!(
+            api.get_wallet_balance(alice.address().as_str()),
+            9_000_000
+        );
+    }
 }

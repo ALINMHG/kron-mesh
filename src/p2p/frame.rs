@@ -23,6 +23,8 @@ pub const KIND_PING: u8 = 13;
 pub const KIND_PONG: u8 = 14;
 pub const KIND_FIND_NODE: u8 = 15;
 pub const KIND_NEIGHBORS: u8 = 16;
+/// `kron-mesh/1` Have/Need / vertex body inside a Noise XX session.
+pub const KIND_MESH: u8 = 20;
 
 pub fn configure_socket(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true)?;

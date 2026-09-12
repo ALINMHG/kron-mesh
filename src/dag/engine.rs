@@ -216,7 +216,8 @@ impl KronDAG {
     }
 
     /// Credit the local ledger only (bootstrap / test faucet). Not a DAG vertex
-    /// and does **not** increase [`Self::current_supply`].
+    /// and does **not** increase [`Self::current_supply`]. Never gossiped as
+    /// spendable: peers must not apply this via `SyncInventory`.
     pub fn credit_account(&mut self, address: Address, amount: u64) {
         if amount == 0 {
             return;
@@ -227,17 +228,15 @@ impl KronDAG {
         *faucet = faucet.saturating_add(amount);
     }
 
-    /// Faucet map for snapshots and `SyncInventory` (not minted supply).
+    /// Local faucet map for WAL snapshots (not minted supply, not on the wire).
     pub fn faucet_snapshot(&self) -> std::collections::BTreeMap<Address, u64> {
         self.faucet.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
-    /// Union a peer's faucet advertisement. Only the missing delta is credited.
-    pub fn apply_faucet_hint(&mut self, address: Address, amount: u64) {
-        let have = self.faucet.get(&address).copied().unwrap_or(0);
-        if amount > have {
-            self.credit_account(address, amount - have);
-        }
+    /// Peer faucet advertisements are not spendable. Kept so older call sites
+    /// compile; never credits [`Self::balance`].
+    pub fn apply_faucet_hint(&mut self, _address: Address, _amount: u64) {
+        // Unauthenticated gossip must not mint or credit spendable balances.
     }
 
     /// True when `id` is stored but excluded from the ledger (conflict loser).
@@ -404,7 +403,7 @@ impl KronDAG {
         device: AttachingDevice,
     ) -> Result<(), DagError> {
         device.admit_host()?;
-        let relays = tx.relay_nodes.clone();
+        let relays = tx.proven_relay_nodes();
         self.attach_vertex_and_maybe_mint(tx, true, &relays)
     }
 
@@ -787,7 +786,7 @@ impl KronDAG {
         }
         self.next_nonce
             .insert(tx.sender, expected.saturating_add(1));
-        mint_confirmed_tx(self, tx.fee, tx.sender, &tx.relay_nodes).map_err(|e| match e {
+        mint_confirmed_tx(self, tx.fee, tx.sender, &tx.proven_relay_nodes()).map_err(|e| match e {
             EconomicError::Overflow => DagError::Overflow,
         })?;
         Ok(())
@@ -812,4 +811,27 @@ fn signed_genesis_tx() -> DagTransaction {
         0,
     )
     .expect("genesis ML-DSA-44 sign")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kron::generate_kron_wallet_from_rng;
+    use rand::SeedableRng;
+
+    #[test]
+    fn peer_faucet_hint_does_not_credit_spendable() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xFA0C);
+        let alice = generate_kron_wallet_from_rng(&mut rng);
+        let mut dag = KronDAG::with_genesis();
+        let addr = *alice.address().as_bytes();
+        assert_eq!(dag.balance(&addr), 0);
+        dag.apply_faucet_hint(addr, 9_000_000);
+        assert_eq!(dag.balance(&addr), 0);
+        assert!(dag.faucet_snapshot().is_empty());
+        dag.credit_account(addr, 1_000);
+        assert_eq!(dag.balance(&addr), 1_000);
+        dag.apply_faucet_hint(addr, 50_000);
+        assert_eq!(dag.balance(&addr), 1_000);
+    }
 }

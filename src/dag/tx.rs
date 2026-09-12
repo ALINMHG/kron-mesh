@@ -92,8 +92,34 @@ impl DagTransaction {
         self.id = Self::compute_id(&self.unsigned_bytes());
     }
 
-    /// Verify every [`RelayProof`]. Empty proofs are valid (local attach).
+    /// Relays that have a matching valid carrier proof (payout set).
+    pub fn proven_relay_nodes(&self) -> Vec<RelayNodeId> {
+        if !self.verify_relay_proofs() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.relay_proofs.len());
+        for proof in &self.relay_proofs {
+            if !out.contains(&proof.node) {
+                out.push(proof.node);
+            }
+        }
+        out
+    }
+
+    /// Verify every [`RelayProof`]. Empty nodes **and** empty proofs is valid
+    /// (local attach, miner keeps the 20%). Nodes without matching proofs fail.
     pub fn verify_relay_proofs(&self) -> bool {
+        if self.relay_nodes.is_empty() {
+            return self.relay_proofs.is_empty();
+        }
+        if self.relay_proofs.is_empty() {
+            return false;
+        }
+        for node in &self.relay_nodes {
+            if !self.relay_proofs.iter().any(|p| p.node == *node) {
+                return false;
+            }
+        }
         for proof in &self.relay_proofs {
             if proof.public_key.address() != proof.node {
                 return false;

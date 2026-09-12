@@ -96,7 +96,7 @@ struct Args {
     port: u16,
     explorer_port: u16,
     data_dir: PathBuf,
-    follow: Option<SocketAddr>,
+    follow: Vec<SocketAddr>,
     name: String,
     print_identity: bool,
     /// Home-PC viewer: no gossip fan-out.
@@ -323,20 +323,23 @@ fn run_gateway(args: Args) -> Result<(), String> {
     };
 
     let p2p = Arc::new(p2p);
-    if let Some(peer) = args.follow {
-        if is_self_hub_target(peer, args.port, Some(args.public_ip), lan) {
+    let mut followed = 0usize;
+    for peer in &args.follow {
+        if is_self_hub_target(*peer, args.port, Some(args.public_ip), lan) {
             kron_log(
                 role_label,
                 format!("skip self-dial {peer} (this process is the hub)"),
             );
-        } else {
-            kron_log(
-                role_label,
-                format!("following {peer} (gossip client in background)"),
-            );
-            spawn_peer_link(p2p.clone(), hub.clone(), peer, stop.clone(), "follow");
+            continue;
         }
-    } else if args.viewer {
+        kron_log(
+            role_label,
+            format!("following {peer} (gossip client in background)"),
+        );
+        spawn_peer_link(p2p.clone(), hub.clone(), *peer, stop.clone(), "follow");
+        followed = followed.saturating_add(1);
+    }
+    if followed == 0 && args.viewer {
         kron_log(
             role_label,
             format!("no --follow — open {explorer_url} or --follow {DEFAULT_BOOTSTRAP}"),

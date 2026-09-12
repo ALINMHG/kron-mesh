@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use crate::listen::bind_tcp_reuse;
 use crate::p2p::error::NetworkError;
-use crate::p2p::frame::{KIND_INV, KIND_PAYLOAD, KIND_PING, KIND_PONG, KIND_WANT};
+use crate::p2p::frame::{KIND_INV, KIND_MESH, KIND_PAYLOAD, KIND_PING, KIND_PONG, KIND_WANT};
 use crate::p2p::gossip::{GossipEngine, GossipInventory, GossipPayload, GossipWant};
 use crate::p2p::handshake::{perform_secure_handshake, HandshakeConfig};
-use crate::p2p::mesh::{serve_mesh_session, MeshGraph, MESH_MAGIC};
+use crate::p2p::mesh::{MeshGraph, MESH_MAGIC};
 use crate::p2p::noise::NoiseSession;
 use crate::p2p::overlay::NodeOverlayId;
 use crate::p2p::peer::{PeerInfo, PeerRole};
@@ -118,6 +118,7 @@ impl P2pNode {
             self.gossip.clone(),
             self.sessions.clone(),
             self.delivered.clone(),
+            None,
         );
         Ok(info)
     }
@@ -234,6 +235,34 @@ fn handle_inbound(
 ) {
     let _ = stream.set_nonblocking(false);
     if inbound_is_mesh(&stream) {
+        crate::kron_elog(
+            "KRON P2P",
+            format!("rejected cleartext KRMS from {from} (Noise handshake required)"),
+        );
+        return;
+    }
+    let mut session = match NoiseSession::handshake(stream, false) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut cfg = hs;
+    cfg.initiator = false;
+    let info = match perform_secure_handshake(&mut session, &cfg) {
+        Ok(i) => i,
+        Err(_) => {
+            session.shutdown();
+            return;
+        }
+    };
+    let _ = table.lock().unwrap().insert(info.peer.clone());
+    let first = match session.read_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            session.shutdown();
+            return;
+        }
+    };
+    if first.0 == KIND_MESH {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let graph_ref = loop {
             if let Some(g) = graph.lock().unwrap().clone() {
@@ -247,7 +276,7 @@ fn handle_inbound(
         match graph_ref {
             Some(g) => {
                 crate::kron_log("KRON P2P", format!("inbound kron-mesh/1 from {from}"));
-                serve_mesh_session(stream, g);
+                crate::p2p::mesh::serve_authenticated_mesh_from_first(session, g, first.1);
             }
             None => {
                 crate::kron_elog(
@@ -258,28 +287,15 @@ fn handle_inbound(
         }
         return;
     }
-    let mut session = match NoiseSession::handshake(stream, false) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut cfg = hs;
-    cfg.initiator = false;
-    match perform_secure_handshake(&mut session, &cfg) {
-        Ok(info) => {
-            let _ = table.lock().unwrap().insert(info.peer.clone());
-            spawn_session(
-                session,
-                info.peer.id,
-                stop,
-                gossip,
-                sessions,
-                delivered,
-            );
-        }
-        Err(_) => {
-            session.shutdown();
-        }
-    }
+    spawn_session(
+        session,
+        info.peer.id,
+        stop,
+        gossip,
+        sessions,
+        delivered,
+        Some(first),
+    );
 }
 
 /// Wait until four bytes are peekable so a slow `kron-mesh/1` hello is not
@@ -312,6 +328,7 @@ fn spawn_session(
     gossip: Arc<Mutex<GossipEngine>>,
     sessions: Arc<Mutex<HashMap<Address, Sender<SessionCmd>>>>,
     delivered: Arc<Mutex<Vec<(Address, MeshMessage)>>>,
+    first_frame: Option<(u8, Vec<u8>)>,
 ) {
     let (tx, rx) = mpsc::channel();
     sessions.lock().unwrap().insert(peer_id, tx);
@@ -319,6 +336,7 @@ fn spawn_session(
         .name("p2p-session".into())
         .spawn(move || {
             let _ = session.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut pending = first_frame;
             while !stop.load(Ordering::SeqCst) {
                 while let Ok(cmd) = rx.try_recv() {
                     let _ = match cmd {
@@ -328,7 +346,12 @@ fn spawn_session(
                         SessionCmd::Ping => session.write_frame(KIND_PING, &[]),
                     };
                 }
-                match session.read_frame() {
+                let frame = if let Some(first) = pending.take() {
+                    Ok(first)
+                } else {
+                    session.read_frame()
+                };
+                match frame {
                     Ok((KIND_INV, payload)) => {
                         if let Ok(inv) = GossipInventory::decode(&payload) {
                             let want = gossip.lock().unwrap().on_inventory(&inv);

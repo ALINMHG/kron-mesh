@@ -263,15 +263,21 @@ pub fn format_hub_connect_error(addr: SocketAddr, err: &NetworkError) -> String 
 pub fn spawn_hub_dial(
     p2p: Arc<P2pNode>,
     graph: Arc<dyn MeshGraph>,
-    addr: SocketAddr,
+    addrs: Vec<SocketAddr>,
     stop: Arc<AtomicBool>,
     log_prefix: &'static str,
 ) {
+    if addrs.is_empty() {
+        return;
+    }
     let _ = thread::Builder::new()
         .name("kron-hub-dial".into())
         .spawn(move || {
             let mut announced = false;
+            let mut idx = 0usize;
             while !stop.load(Ordering::SeqCst) {
+                let addr = addrs[idx % addrs.len()];
+                idx = idx.saturating_add(1);
                 if !announced {
                     kron_log(log_prefix, format!("connecting to hub {addr} ..."));
                 }

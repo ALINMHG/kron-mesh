@@ -28,7 +28,7 @@ pub use error::DagError;
 pub use minting::{
     apply_dag_minting_as_miner, apply_dag_minting_from_sender, apply_dag_minting_natively,
 };
-pub use reconciliation::{compute_dag_diff, SyncInventory};
+pub use reconciliation::{compute_dag_diff, SyncInventory, MAX_INVENTORY_HASHES};
 pub use sync::{
     exchange_and_merge, mesh_handshake, mesh_relay_split, relay_share, MeshPhone, MeshSession,
     MeshSyncEngine, NodeId, OfflineLink, RelayLedger, SyncError, HANDSHAKE_RETRIES,
@@ -300,11 +300,9 @@ mod tests {
 
         assert_eq!(dag_b.relay_node(&tx_a.id), Some(mule));
         assert_eq!(dag_a.relay_node(&tx_b.id), Some(mule));
-        let pool = INITIAL_TX_SUBSIDY + FIXED_TRANSACTION_FEE;
-        let relay_cut = crate::economics::dag_relay_total_of(pool);
-        assert_eq!(relay_cut, 20_200);
-        assert_eq!(dag_b.relay_credit(&mule), relay_cut);
-        assert_eq!(dag_a.relay_credit(&mule), relay_cut);
+        // Unsigned mule sidecar is recorded, but 20% pays only proven relays.
+        assert_eq!(dag_b.relay_credit(&mule), 0);
+        assert_eq!(dag_a.relay_credit(&mule), 0);
         assert_eq!(crate::economics::RELAY_SHARE_PERCENT, 20);
     }
 }

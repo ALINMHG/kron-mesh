@@ -147,6 +147,46 @@ fn follow_mesh_sync_through_shared_p2p_port() {
 }
 
 #[test]
+fn unauthenticated_vertex_inject_is_rejected() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x554E_4155);
+    let alice = generate_kron_wallet_from_rng(&mut rng);
+    let bob = generate_kron_wallet_from_rng(&mut rng);
+    let mut dag = KronDAG::with_genesis();
+    dag.credit_account(*alice.address().as_bytes(), 1_000_000);
+    let tx = dag
+        .compose_and_sign_with_rng(&alice, *bob.address().as_bytes(), 1_000, &mut rng)
+        .unwrap();
+
+    let hs = HandshakeConfig::honest(
+        LatticeKeyPair::generate(&mut rng),
+        PeerRole::CoreValidator,
+        DeviceClass::PersonalComputer,
+        false,
+    );
+    let hub_node = P2pNode::bind(hs).unwrap();
+    let hub = HubState::new(KronDAG::with_genesis());
+    {
+        let mut locked = hub.lock_dag();
+        locked.credit_account(*alice.address().as_bytes(), 1_000_000);
+    }
+    hub_node.attach_graph(hub.clone());
+    thread::sleep(Duration::from_millis(40));
+
+    let mut raw = std::net::TcpStream::connect_timeout(&hub_node.addr, Duration::from_secs(2))
+        .expect("tcp");
+    let _ = new_blockchain::p2p::frame::configure_socket(&mut raw);
+    let body = tx.canonical_bytes();
+    new_blockchain::p2p::mesh::write_mesh_frame(&mut raw, new_blockchain::p2p::mesh::MK_DAG_TX, &body)
+        .ok();
+    thread::sleep(Duration::from_millis(80));
+    assert!(
+        !hub.contains(&tx.id),
+        "cleartext KRMS vertex must not be ingested"
+    );
+    hub_node.shutdown();
+}
+
+#[test]
 fn signed_tx_roundtrip_is_dag_transaction_not_shared_map() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(1);
     let a = generate_kron_wallet_from_rng(&mut rng);

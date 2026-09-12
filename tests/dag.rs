@@ -149,8 +149,9 @@ fn test_kron_mountain_offline_sync() {
     assert_eq!(relay_share_of(FIXED_TRANSACTION_FEE), 200);
     let relay_cut = dag_relay_total_of(INITIAL_TX_SUBSIDY + FIXED_TRANSACTION_FEE);
     assert_eq!(relay_cut, 20_200);
-    assert_eq!(dag_b.relay_credit(&mule), relay_cut);
-    assert_eq!(dag_a.relay_credit(&mule), relay_cut);
+    // Unsigned mule sidecar is recorded; 20% pays only proven relays.
+    assert_eq!(dag_b.relay_credit(&mule), 0);
+    assert_eq!(dag_a.relay_credit(&mule), 0);
     assert_eq!(RELAY_SHARE_PERCENT, 20);
 }
 
@@ -168,10 +169,8 @@ fn test_offline_mesh_merging() {
     const CREDIT: u64 = 1_000_000;
     const SEND: u64 = 10_000;
     let pool = INITIAL_TX_SUBSIDY + FIXED_TRANSACTION_FEE;
-    let miner_cut = dag_miner_share_of(pool);
-    let relay_cut = dag_relay_total_of(pool);
-    assert_eq!(miner_cut, 80_800);
-    assert_eq!(relay_cut, 20_200);
+    assert_eq!(dag_miner_share_of(pool), 80_800);
+    assert_eq!(dag_relay_total_of(pool), 20_200);
 
     let mut shared = KronDAG::with_genesis();
     shared.credit_account(addr_a, CREDIT);
@@ -249,24 +248,18 @@ fn test_offline_mesh_merging() {
         assert!(dag.tips_are_consistent());
     }
 
-    // Imported vertices on A: B's and C's txs pay 80/20 with mule A.
+    // Imported vertices record the mule sidecar; 20% requires a signed proof.
     assert_eq!(dag_a.relay_node(&tx_b.id), Some(mule));
     assert_eq!(dag_a.relay_node(&tx_c.id), Some(mule));
-    assert_eq!(dag_a.relay_credit(&mule), relay_cut.saturating_mul(2));
+    assert_eq!(dag_a.relay_credit(&mule), 0);
 
-    // Local attach of A's own tx: no relays → miner kept the whole pool.
-    // Then two imports: A receives SEND from C, plus 2× relay_cut as mule.
-    let expected_a = CREDIT - SEND - FIXED_TRANSACTION_FEE
-        + pool
-        + SEND
-        + relay_cut.saturating_mul(2);
+    // No proven relays → each miner keeps the whole pool. A also receives SEND from C.
+    let expected_a = CREDIT - SEND - FIXED_TRANSACTION_FEE + pool + SEND;
     assert_eq!(dag_a.balance(&addr_a), expected_a);
 
-    // B on A's ledger: started CREDIT, received SEND from A, spent SEND+fee
-    // on imported tx, received miner_cut (80%).
-    let expected_b_on_a = CREDIT + SEND - SEND - FIXED_TRANSACTION_FEE + miner_cut;
+    let expected_b_on_a = CREDIT + SEND - SEND - FIXED_TRANSACTION_FEE + pool;
     assert_eq!(dag_a.balance(&addr_b), expected_b_on_a);
-    let expected_c_on_a = CREDIT + SEND - SEND - FIXED_TRANSACTION_FEE + miner_cut;
+    let expected_c_on_a = CREDIT + SEND - SEND - FIXED_TRANSACTION_FEE + pool;
     assert_eq!(dag_a.balance(&addr_c), expected_c_on_a);
 
     // Offline double-spend: stored as conflict; exactly one spend stays in balances.
@@ -354,7 +347,7 @@ fn test_hard_cap_and_fee_only_phase() {
             &mut rng,
         )
         .unwrap();
-    tx.relay_nodes.push(*relay.address().as_bytes());
+    tx = new_blockchain::dag::relay_intercept_and_sign(tx, &relay);
     dag.attach_and_verify_tx(tx).unwrap();
 
     assert_eq!(dag.current_supply, HARD_CAP, "supply must not grow");

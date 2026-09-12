@@ -313,10 +313,8 @@ impl KronDAG {
             }
             let id = tx.id;
             let is_genesis = tx.is_genesis();
-            let mut tx = tx;
-            if !tx.relay_nodes.contains(&relay_node_id) {
-                tx.relay_nodes.push(relay_node_id);
-            }
+            // Unsigned sidecar names do not get the 20% split. Only proven
+            // relay_nodes already on the vertex are paid.
             match self.insert_graph_only(tx) {
                 Ok(()) => {
                     if !is_genesis {
@@ -498,12 +496,14 @@ mod tests {
             )
             .unwrap();
         dag_a.attach_and_verify_tx(tx.clone()).unwrap();
+        let carried = crate::dag::relay_intercept_and_sign(tx.clone(), &alice);
+        assert!(carried.verify_relay_proofs());
         let n = dag_b
-            .merge_offline_graphs(vec![tx.clone()], a.id())
+            .merge_offline_graphs(vec![carried.clone()], a.id())
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(
-            dag_b.merge_offline_graphs(vec![tx], a.id()).unwrap(),
+            dag_b.merge_offline_graphs(vec![carried], a.id()).unwrap(),
             0,
             "duplicate insert must be ignored"
         );
