@@ -17,15 +17,20 @@ Same Wi‑Fi phones auto-find each other (LAN UDP beacon). Different networks jo
 
 On Ubuntu. This process does **not** mine. Listen without `--follow` is hub mode (`--hub` is an alias). Binds `0.0.0.0:8000` (mesh) and `0.0.0.0:8080` (explorer).
 
-Already have `~/kron-mesh`? Do **not** clone again:
+Already have `~/kron-mesh`? Do **not** clone again. Do **not** run `apt` (it does not update KRON). `--hub` is optional; do not pass it.
 
 ```bash
 cd ~/kron-mesh
-git pull
+git status
+git pull origin main
 cargo build --release -p new-blockchain
-tmux kill-session -t kron 2>/dev/null; tmux new -s kron
-./target/release/kron-node --hub --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
+pkill -f kron-node || true
+tmux kill-session -t kron 2>/dev/null || true
+tmux new -s kron
+./target/release/kron-node --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
 ```
+
+Then **Ctrl+B**, **D**. Explorer: http://144.91.105.244:8080
 
 First time only (empty home directory):
 
@@ -39,7 +44,7 @@ cargo build --release -p new-blockchain
 sudo mkdir -p /var/lib/kron
 sudo ufw allow 8000/tcp && sudo ufw allow 8080/tcp && sudo ufw reload
 tmux new -s kron
-sudo ./target/release/kron-node --hub --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
+sudo ./target/release/kron-node --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
 ```
 
 Detach tmux: `Ctrl+B` then `D`. Reattach: `tmux attach -t kron`.
@@ -126,12 +131,19 @@ Logs: `journalctl -u kron-hub -f`
 After login, paste this. `Ctrl+B` then `D` detaches. Closing PuTTY after that leaves the hub running.
 
 ```bash
-sudo apt-get update && sudo apt-get install -y tmux
 cd ~/kron-mesh
+git status
+git pull origin main
+cargo build --release -p new-blockchain
+pkill -f kron-node || true
+tmux kill-session -t kron 2>/dev/null || true
 tmux new -s kron
-sudo mkdir -p /var/lib/kron
-sudo ./target/release/kron-node --hub --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
+./target/release/kron-node --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
 ```
+
+Then **Ctrl+B**, **D**. Explorer: http://144.91.105.244:8080
+
+Do not run `apt`. Do not pass `--hub` (older binaries reject it; listen without `--follow` is hub).
 
 If `tmux new -s kron` prints `duplicate session: kron`, a session already exists (often from a previous SSH). Do **not** start a second `kron-node` in the raw PuTTY shell — that dies on disconnect.
 
@@ -150,7 +162,7 @@ One-shot without tmux (still dies on reboot):
 
 ```bash
 sudo mkdir -p /var/lib/kron
-nohup sudo ./target/release/kron-node --hub --port 8000 --explorer-port 8080 --data-dir /var/lib/kron > /tmp/kron-hub.log 2>&1 &
+nohup sudo ./target/release/kron-node --port 8000 --explorer-port 8080 --data-dir /var/lib/kron > /tmp/kron-hub.log 2>&1 &
 disown
 ```
 
@@ -277,7 +289,7 @@ Wallet file on Windows: `%APPDATA%\KRON\wallet.json` (never commit it).
 ```bash
 cargo test --workspace
 cargo build --release -p new-blockchain     # Termux: kron-phone + kron-node (no --bin)
-cargo build --release --bin kron-node       # VPS --hub, ARM hub, or Windows viewer
+cargo build --release --bin kron-node       # VPS hub, ARM hub, or Windows viewer
 cargo build --release --bin kron-phone-miner # optional attach-only miner
 cargo build --release -p kron-wallet        # optional desktop GUI
 ```
@@ -292,7 +304,7 @@ cargo build --release -p kron-wallet        # optional desktop GUI
 | **8001** | LAN discovery UDP beacon (`p2p_port + 1`) |
 | **8080** | Explorer HTTP. Public: http://144.91.105.244:8080 |
 
-If the public explorer does not load: confirm `kron-hub` / `kron-node --hub` is still running (`systemctl status kron-hub` or `tmux attach -t kron`), open **:8080** not **:8000**, and allow TCP 8000/8080 in **both** ufw and the Contabo/Hetzner panel.
+If the public explorer does not load: confirm `kron-hub` / `kron-node` is still running (`systemctl status kron-hub` or `tmux attach -t kron`), open **:8080** not **:8000**, and allow TCP 8000/8080 in **both** ufw and the Contabo/Hetzner panel.
 
 If error 98 (`Address already in use`), stop the leftover process: `pkill -f kron-phone`. Then mine again, or use `--port 8001`. Do not auto-increment unless you pass `--port-auto`.
 
@@ -318,7 +330,7 @@ Bootstrap config (no SSH, no passwords in this repo):
 - Write the **24-word** phrase on paper. Do not screenshot it or share it.
 - Do not commit `wallet.json`, `identity.seed`, `wallet.seed`, `wallet.mnemonic`, `.env`, or AppData copies.
 - Anyone with the phrase can spend the `kron1` address.
-- Mining requires a real phone ARM profile. x86 hosts cannot mine. `kron-node --hub` on the VPS is a relay only.
+- Mining requires a real phone ARM profile. x86 hosts cannot mine. `kron-node` on the VPS (no `--follow`) is a relay only.
 
 ## Conflict rule
 

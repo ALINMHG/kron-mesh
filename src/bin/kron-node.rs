@@ -47,7 +47,7 @@ KRON Mesh node — phones mine. A paid VPS listens; phones connect inbound.
 
 VPS (x86 Linux OK) — gossip relay + explorer. Never mines. No --follow:
   kron-node --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
-  kron-node --hub --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
+  # --hub is an optional alias of the same mode; do not require it
   # ufw allow 8000 && ufw allow 8080
   # phones: kron-phone --mine --reward-address kron1...   (dials this hub by default)
   # browser: http://144.91.105.244:8080
