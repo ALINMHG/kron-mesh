@@ -21,8 +21,8 @@ Two phones sync over LAN. An offline PC does not stop the mesh. x86 mining is re
 
 ```bash
 pkg install rust git
-git clone <this-repo-url>
-cd new-blockchain
+git clone https://github.com/ALINMHG/kron-mesh.git
+cd kron-mesh
 cargo build --release --bin kron-phone
 ./target/release/kron-phone
 ```
