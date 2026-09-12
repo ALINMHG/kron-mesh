@@ -8,7 +8,7 @@ pub mod indexer;
 pub mod seed;
 
 pub use api::{get_kron_asset_metadata, ExplorerApi};
-pub use http::start_explorer_http;
+pub use http::{start_explorer_http, start_explorer_http_advertised, start_explorer_http_on};
 pub use seed::seed_demo_if_empty;
 pub use indexer::{
     index_vertex, parse_explorer_address, ExplorerEngine, FeeSplit, IndexedTransaction,

@@ -1,0 +1,29 @@
+[Unit]
+Description=KRON Mesh public hub (gossip relay + explorer, no mining)
+Documentation=https://github.com/ALINMHG/kron-mesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kron
+Group=kron
+WorkingDirectory=/var/lib/kron
+ExecStart=/usr/local/bin/kron-node --hub --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+SyslogIdentifier=kron-hub
+
+# Host firewall is not this unit. On the VPS:
+#   sudo ufw allow 8000/tcp
+#   sudo ufw allow 8080/tcp
+#   sudo ufw reload
+# Contabo / Hetzner / other cloud panels also have their own inbound firewall.
+# ufw alone is not enough if the panel drops 8000/8080. Allow TCP 8000 and 8080
+# there, then attach the rule to this VPS.
+# Browser: http://144.91.105.244:8080   (HTTP explorer)
+# Phones:  144.91.105.244:8000          (P2P — not a web page)
+
+[Install]
+WantedBy=multi-user.target

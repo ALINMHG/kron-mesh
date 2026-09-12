@@ -10,22 +10,35 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use new_blockchain::anti_bot::profile::DeviceClass;
 use new_blockchain::crypto::mobile_only::enforce_real_mobile;
 use new_blockchain::dag::AttachingDevice;
-use new_blockchain::economics::{FIXED_TRANSACTION_FEE, UNITS_PER_COIN};
+use new_blockchain::economics::UNITS_PER_COIN;
 use new_blockchain::persist::{DagSnapshot, DagStore};
 use new_blockchain::explorer::start_explorer_http;
-use new_blockchain::kron::{
-    generate_recovery_wallet, load_mnemonic, load_phone_wallet, phone_wallet_exists,
-    save_phone_wallet, KronAddress, KronKeypair,
+use new_blockchain::kron::cli::{
+    is_incomplete_kron1, looks_like_kron1, parse_kron1_arg, parse_menu_reward_input, parse_phone_cli,
+    sanitize_cli_value, split_eq_flag, take_cli_value, unknown_argument, CREDIT_FLAGS, PhoneCli,
 };
+use new_blockchain::kron::{is_self_hub_target, resolve_phone_bootstrap};
+use new_blockchain::listen::{
+    detect_lan_ipv4, format_lan_address_line, format_p2p_listen_line, is_addr_in_use,
+    log_port_in_use, port_auto_candidates,
+};
+use new_blockchain::kron::{
+    generate_recovery_wallet, load_mnemonic, load_phone_wallet, miner_tick, phone_wallet_exists,
+    save_phone_wallet, KronAddress, KronKeypair, MinerTickStatus,
+};
+use new_blockchain::{kron_elog, kron_log};
 use new_blockchain::p2p::handshake::HandshakeConfig;
-use new_blockchain::p2p::mesh::{mesh_sync_connect, HubState, MeshGraph, MeshRole};
+use new_blockchain::p2p::mesh::{HubState, MeshGraph};
+use new_blockchain::p2p::overlay::NodeOverlayId;
 use new_blockchain::p2p::peer::PeerRole;
-use new_blockchain::p2p::P2pNode;
+use new_blockchain::p2p::{
+    spawn_hub_dial, spawn_lan_discovery, DiscoveryConfig, NetworkError, P2pNode,
+};
 use new_blockchain::types::message::MeshMessage;
 
 const USAGE: &str = "\
@@ -34,38 +47,33 @@ KRON Mesh Termux client — phones ARE the network (node + miner, no PC required
 USAGE
   kron-phone
   kron-phone --generate-wallet [--data-dir DIR]
-  kron-phone --mine --reward-address kron1... [--port PORT] [--explorer-port PORT]
-  kron-phone --hub [--port PORT] [--bootstrap <PHONE_IP>:8000]
+  kron-phone --mine --reward-address kron1... [--port PORT] [--port-auto] [--explorer-port PORT]
+  kron-phone --mine --miner-address kron1...
+  kron-phone --mine kron1...
+  kron-phone --hub [--port PORT]
+  kron-phone --mine --reward-address kron1... --no-discovery
+  kron-phone --mine --reward-address kron1... --no-bootstrap
   kron-phone credit --to kron1... --amount AMOUNT [--data-dir DIR]
   kron-phone --show-mnemonic [--data-dir DIR]
   kron-phone --help
 
-Two phones on LAN (no Windows process):
-  ./kron-phone --mine --reward-address kron1... --port 8000
-  ./kron-phone --mine --reward-address kron1... --port 8000 --bootstrap <PHONE1_IP>:8000
+Same Wi‑Fi: two phones `--mine` find each other (UDP beacon on port+1). No PHONE_IP.
+Internet: after listen, dials 144.91.105.244:8000 (override with --bootstrap / KRON_BOOTSTRAP).
+  ./kron-phone --mine --reward-address kron1...
+  ./kron-phone --mine --reward-address kron1... --no-bootstrap
 
-Optional phone explorer: add --explorer-port 8080
-PC viewer (optional): kron-node --follow <PHONE_IP>:8000 --explorer-port 8080 --read-only
+Mining binds P2P 0.0.0.0:8000 (all interfaces) and explorer 0.0.0.0:8080.
+Mesh ID is an fd00::/8 overlay id (not a public IP). LAN IPv4 is only for a PC explorer.
+PC viewer (optional): kron-node --follow <PHONE_OR_VPS_IP>:8000 --explorer-port 8080 --read-only
 
 Interactive menu (no flags):
-  1) Generate KRON address + 24-word passphrase (write it down; not reprinted later)
-  2) Mine to a kron1 address; this phone's node stays running (the network)
+  1) Generate KRON address + 24-word passphrase (wallet only — does not listen)
+  2) Mine — prompt for a kron1 address; binds P2P :8000 + explorer :8080 once
 
 On x86/Windows, option 2 / --mine / --hub are refused.
 ";
 
-struct Cli {
-    generate: bool,
-    mine: bool,
-    hub_only: bool,
-    show_mnemonic: bool,
-    reward: Option<KronAddress>,
-    port: u16,
-    explorer_port: Option<u16>,
-    data_dir: PathBuf,
-    bootstrap: Option<SocketAddr>,
-    phone: bool,
-}
+type Cli = PhoneCli;
 
 fn main() {
     if let Err(err) = run() {
@@ -83,7 +91,7 @@ fn run() -> Result<(), String> {
     if raw.first().map(|s| s.as_str()) == Some("credit") {
         return run_credit(&raw[1..]);
     }
-    let cli = parse_cli(&raw)?;
+    let cli = parse_phone_cli(&raw)?;
     if cli.generate {
         return generate_wallet(&cli.data_dir);
     }
@@ -94,94 +102,72 @@ fn run() -> Result<(), String> {
         return start_hub_only(&cli);
     }
     if cli.mine {
-        let reward = cli
-            .reward
-            .clone()
-            .ok_or_else(|| String::from("--mine requires --reward-address kron1..."))?;
+        let reward = match cli.reward.clone() {
+            Some(addr) => addr,
+            None if cli.prompt_mine => prompt_reward_address()?,
+            None => {
+                return Err(String::from(
+                    "--mine requires --reward-address kron1... (or --miner-address / positional kron1...)",
+                ))
+            }
+        };
         return start_node_and_mine(&cli, reward);
     }
     interactive_menu(&cli)
 }
 
-fn parse_cli(raw: &[String]) -> Result<Cli, String> {
-    let mut generate = false;
-    let mut mine = false;
-    let mut hub_only = false;
-    let mut show_mnemonic = false;
-    let mut reward = None;
-    let mut port = 8000u16;
-    let mut explorer_port = None;
-    let mut data_dir = None;
-    let mut bootstrap = None;
-    let mut phone = false;
-    let mut i = 0;
-    while i < raw.len() {
-        match raw[i].as_str() {
-            "--generate-wallet" => generate = true,
-            "--mine" => mine = true,
-            "--hub" | "--node-only" => hub_only = true,
-            "--show-mnemonic" => show_mnemonic = true,
-            "--phone" => phone = true,
-            "--reward-address" | "--miner-address" => {
-                i += 1;
-                let v = raw
-                    .get(i)
-                    .ok_or_else(|| String::from("--reward-address requires kron1..."))?;
-                reward = Some(KronAddress::parse(v).map_err(|e| e.to_string())?);
-            }
-            "--port" => {
-                i += 1;
-                port = raw
-                    .get(i)
-                    .ok_or("--port requires a value")?
-                    .parse()
-                    .map_err(|_| "invalid --port")?;
-            }
-            "--explorer-port" => {
-                i += 1;
-                explorer_port = Some(
-                    raw.get(i)
-                        .ok_or("--explorer-port requires a value")?
-                        .parse()
-                        .map_err(|_| "invalid --explorer-port")?,
-                );
-            }
-            "--data-dir" => {
-                i += 1;
-                data_dir = Some(PathBuf::from(
-                    raw.get(i).ok_or("--data-dir requires a path")?,
-                ));
-            }
-            "--bootstrap" | "--node" => {
-                i += 1;
-                let v = raw.get(i).ok_or("--bootstrap requires IP:PORT")?;
-                bootstrap = Some(v.parse().map_err(|_| format!("invalid --bootstrap '{v}'"))?);
-            }
-            "--no-mine" => {}
-            other => return Err(format!("unknown argument: {other}")),
+fn prompt_reward_address() -> Result<KronAddress, String> {
+    loop {
+        print!("Enter KRON wallet address (kron1...): ");
+        let _ = io::stdout().flush();
+        let mut addr = String::new();
+        let n = io::stdin()
+            .read_line(&mut addr)
+            .map_err(|e| format!("stdin: {e}"))?;
+        if n == 0 {
+            return Err("stdin closed".into());
         }
-        i += 1;
+        // Termux wraps ~63-char addresses; keep reading continuation lines.
+        for _ in 0..4 {
+            if !is_incomplete_kron1(&addr) {
+                break;
+            }
+            let mut more = String::new();
+            let n = io::stdin()
+                .read_line(&mut more)
+                .map_err(|e| format!("stdin: {e}"))?;
+            if n == 0 || more.trim().is_empty() {
+                break;
+            }
+            addr.push_str(&more);
+        }
+        match parse_menu_reward_input(&addr) {
+            Ok(reward) => return Ok(reward),
+            Err(e) if e == "empty address" => {
+                kron_elog("KRON NODE", "empty address");
+            }
+            Err(e) => {
+                kron_elog("KRON NODE", e);
+            }
+        }
     }
-    Ok(Cli {
-        generate,
-        mine,
-        hub_only,
-        show_mnemonic,
-        reward,
-        port,
-        explorer_port,
-        data_dir: data_dir.unwrap_or_else(|| PathBuf::from("kron-phone")),
-        bootstrap,
-        phone,
-    })
 }
 
 fn interactive_menu(cli: &Cli) -> Result<(), String> {
     loop {
         println!();
-        println!("KRON Mesh (Termux) — phones are the network; PC explorer is optional");
-        println!("1) Generate KRON address (show kron1... and save BIP39 passphrase — write it down)");
-        println!("2) Mine — enter a kron1 reward address; this phone's node stays running");
+        kron_log(
+            "KRON NODE",
+            "KRON Mesh (Termux) — phones are the network; PC explorer is optional",
+        );
+        kron_log(
+            "KRON NODE",
+            "1) Generate KRON address (wallet only — does not start the node or bind :8000)",
+        );
+        kron_log(
+            "KRON NODE",
+            "2) Mine — enter a kron1 reward address; this process binds :8000 once and stays up",
+        );
         println!("q) Quit");
         print!("> ");
         let _ = io::stdout().flush();
@@ -189,26 +175,28 @@ fn interactive_menu(cli: &Cli) -> Result<(), String> {
         io::stdin()
             .read_line(&mut line)
             .map_err(|e| format!("stdin: {e}"))?;
-        match line.trim() {
-            "1" => generate_wallet(&cli.data_dir)?,
+        let choice = line.trim();
+        match choice {
+            "1" => {
+                generate_wallet(&cli.data_dir)?;
+                kron_log(
+                    "KRON NODE",
+                    "wallet only — not listening. Choose 2 or --mine to bind :8000",
+                );
+            }
             "2" => {
-                print!("Enter KRON wallet address (kron1...): ");
-                let _ = io::stdout().flush();
-                let mut addr = String::new();
-                io::stdin()
-                    .read_line(&mut addr)
-                    .map_err(|e| format!("stdin: {e}"))?;
-                let addr = addr.trim();
-                if addr.is_empty() {
-                    eprintln!("[KRON PHONE] empty address");
-                    continue;
-                }
-                let reward = KronAddress::parse(addr).map_err(|e| e.to_string())?;
+                let reward = prompt_reward_address()?;
                 start_node_and_mine(cli, reward)?;
                 return Ok(());
             }
             "q" | "Q" => return Ok(()),
-            _ => println!("Choose 1, 2, or q."),
+            other => {
+                if let Ok(reward) = parse_menu_reward_input(other) {
+                    start_node_and_mine(cli, reward)?;
+                    return Ok(());
+                }
+                println!("Choose 1, 2, or q. Paste a kron1... address to mine.");
+            }
         }
     }
 }
@@ -219,6 +207,7 @@ fn generate_wallet(dir: &Path) -> Result<(), String> {
         println!("[KRON PHONE] wallet already saved in {}", dir.display());
         println!("Address = {}", wallet.address().as_str());
         println!("Recovery phrase is not printed again. Use --show-mnemonic if you need it.");
+        println!("Wallet only — this did not start a node (no P2P listen on :8000).");
         return Ok(());
     }
     let (wallet, phrase, entropy) = generate_recovery_wallet();
@@ -229,6 +218,8 @@ fn generate_wallet(dir: &Path) -> Result<(), String> {
     println!("{phrase}");
     println!();
     println!("Saved in {}", dir.display());
+    println!("Wallet only — this did not start a node (no P2P listen on :8000).");
+    println!("To mine: choose 2, or ./kron-phone --mine --reward-address {}", wallet.address().as_str());
     Ok(())
 }
 
@@ -246,8 +237,8 @@ fn refuse_mine_on_pc() -> Result<(), String> {
         eprintln!("[KRON MINER] The library compiles here; this binary must not mine.");
         eprintln!("[KRON MINER] Use Termux on Android (aarch64):");
         eprintln!("  pkg install rust git");
-        eprintln!("  cargo build --release --bin kron-phone");
-        eprintln!("  ./target/release/kron-phone");
+        eprintln!("  cargo build --release -p new-blockchain");
+        eprintln!("  ./target/release/kron-phone --mine --reward-address kron1...");
         return Err("mining is phone-only".into());
     }
     if cfg!(windows) {
@@ -269,12 +260,21 @@ fn start_hub_only(cli: &Cli) -> Result<(), String> {
     } else {
         let (w, phrase, entropy) = generate_recovery_wallet();
         save_phone_wallet(&cli.data_dir, &entropy, &phrase, &w.address())?;
-        println!("[KRON PHONE] created hub identity {}", w.address().as_str());
-        println!("Write these 24 words down:");
-        println!("{phrase}");
+        kron_log(
+            "KRON NODE",
+            format!("created hub identity {}", w.address().as_str()),
+        );
+        kron_log("KRON NODE", "Write these 24 words down:");
+        kron_log("KRON NODE", &phrase);
         w
     };
-    println!("[KRON PHONE] hub-only (no miner) — other phones bootstrap this IP:{}", cli.port);
+    kron_log(
+        "KRON NODE",
+        format!(
+            "hub-only (no miner) — other phones bootstrap this IP:{}",
+            cli.port
+        ),
+    );
     run_combined_node(cli, wallet, None)
 }
 
@@ -289,14 +289,44 @@ fn start_node_and_mine(cli: &Cli, reward: KronAddress) -> Result<(), String> {
     } else {
         let (w, phrase, entropy) = generate_recovery_wallet();
         save_phone_wallet(&cli.data_dir, &entropy, &phrase, &w.address())?;
-        println!("[KRON PHONE] created signing wallet {}", w.address().as_str());
-        println!("Write these 24 words down:");
-        println!("{phrase}");
+        kron_log(
+            "KRON NODE",
+            format!("created signing wallet {}", w.address().as_str()),
+        );
+        kron_log("KRON NODE", "Write these 24 words down:");
+        kron_log("KRON NODE", &phrase);
         w
     };
 
-    println!("Miner address = {}", reward.as_str());
     run_combined_node(cli, wallet, Some(reward))
+}
+
+fn bind_phone_p2p(cli: &Cli, hs: HandshakeConfig) -> Result<(P2pNode, u16), String> {
+    let mut last_in_use: Option<(u16, std::io::Error)> = None;
+    for port in port_auto_candidates(cli.port, cli.port_auto) {
+        let bind = SocketAddr::from(([0, 0, 0, 0], port));
+        match P2pNode::bind_on(hs.clone(), bind) {
+            Ok(p2p) => {
+                if port != cli.port {
+                    kron_log(
+                        "KRON NODE",
+                        format!("P2P bound port {port} (--port-auto; {} was in use)", cli.port),
+                    );
+                }
+                return Ok((p2p, port));
+            }
+            Err(NetworkError::Io(e)) if is_addr_in_use(&e) => {
+                last_in_use = Some((port, e));
+            }
+            Err(e) => return Err(format!("P2P bind failed: {e}")),
+        }
+    }
+    let (port, err) = match last_in_use {
+        Some(pair) => pair,
+        None => (cli.port, std::io::Error::from(std::io::ErrorKind::AddrInUse)),
+    };
+    log_port_in_use("KRON NODE", "P2P", port, "--port", Some(&err));
+    Err("P2P port already in use".into())
 }
 
 fn run_combined_node(
@@ -305,13 +335,17 @@ fn run_combined_node(
     reward: Option<KronAddress>,
 ) -> Result<(), String> {
     let store = DagStore::open(&cli.data_dir).map_err(|e| e.to_string())?;
-    let (dag, _snap) = store.load().map_err(|e| e.to_string())?;
+    let (mut dag, _snap) = store.load().map_err(|e| e.to_string())?;
+    if dag.ensure_genesis() {
+        kron_log("KRON NODE", "created local genesis (empty DAG)");
+    }
     let hub = HubState::new(dag);
     hub.set_store(store);
     {
         let dag = hub.lock_dag();
         hub.api().sync_from_dag(&dag);
     }
+    hub.persist_snapshot();
 
     let hs = HandshakeConfig::honest(
         wallet.lattice().clone(),
@@ -319,40 +353,40 @@ fn run_combined_node(
         DeviceClass::LegacyMobile,
         false,
     );
-    let bind = SocketAddr::from(([0, 0, 0, 0], cli.port));
-    let p2p = P2pNode::bind_on(hs, bind).map_err(|e| format!("P2P bind failed: {e}"))?;
-    println!(
-        "[KRON PHONE] Node listening {} (0.0.0.0:{}) kron-mesh/1",
-        p2p.addr, cli.port
-    );
+    let (p2p, listen_port) = bind_phone_p2p(cli, hs)?;
+    let lan = detect_lan_ipv4();
+    let overlay = NodeOverlayId::from_pubkey(wallet.public_key());
+    kron_log("KRON NODE", format_p2p_listen_line(listen_port));
+    kron_log("KRON NODE", format!("Mesh ID: {}", overlay.to_ula()));
+    kron_log("KRON NODE", wallet.address().as_str());
+    kron_log("KRON NODE", format_lan_address_line(lan, listen_port));
     p2p.attach_graph(hub.clone());
 
-    if let Some(peer) = cli.bootstrap {
-        match p2p.connect(peer) {
-            Ok(info) => println!(
-                "[KRON PHONE] connected to {peer} authenticity={}",
-                info.score.authenticity
-            ),
-            Err(e) => eprintln!("[KRON PHONE] bootstrap {peer} failed: {e}"),
-        }
-        match mesh_sync_connect(peer, hub.clone(), MeshRole::Hub) {
-            Ok(()) => println!(
-                "[KRON PHONE] mesh sync vertices={}",
-                hub.lock_dag().vertex_count()
-            ),
-            Err(e) => eprintln!("[KRON PHONE] mesh sync {peer} failed: {e}"),
-        }
-    }
-
     let stop = Arc::new(AtomicBool::new(false));
-    if let Some(port) = cli.explorer_port {
-        match start_explorer_http(hub.explorer_api(), port, stop.clone()) {
-            Ok(addr) => println!("[KRON PHONE] explorer http://{addr}"),
-            Err(e) => eprintln!("[KRON PHONE] explorer bind failed: {e}"),
+    let p2p = Arc::new(p2p);
+    let hub_addr = resolve_phone_bootstrap(cli.bootstrap, cli.no_bootstrap, &cli.data_dir)?;
+    if let Some(peer) = hub_addr {
+        if is_self_hub_target(peer, listen_port, None, lan) {
+            kron_log(
+                "KRON NODE",
+                format!("skip self-dial {peer} (this process is already listening)"),
+            );
+        } else {
+            let prefix = if reward.is_some() {
+                "KRON MINER"
+            } else {
+                "KRON NODE"
+            };
+            spawn_hub_dial(p2p.clone(), hub.clone(), peer, stop.clone(), prefix);
         }
     }
 
-    let p2p = Arc::new(p2p);
+    let explorer_port = cli.explorer_port.unwrap_or(8080);
+    match start_explorer_http(hub.explorer_api(), explorer_port, stop.clone()) {
+        Ok(_) => {}
+        Err(e) if is_addr_in_use(&e) => {}
+        Err(e) => kron_elog("KRON EXPLORER", format!("bind failed: {e}")),
+    }
     let p2p_loop = p2p.clone();
     let hub_loop = hub.clone();
     let stop_loop = stop.clone();
@@ -361,7 +395,7 @@ fn run_combined_node(
             for (_from, msg) in p2p_loop.take_delivered_from() {
                 let MeshMessage::Vertex(tx) = msg;
                 if let Err(e) = hub_loop.ingest(tx) {
-                    eprintln!("[KRON PHONE] drop vertex: {e}");
+                    kron_elog("KRON NODE", format!("drop vertex: {e}"));
                 }
             }
             thread::sleep(Duration::from_millis(40));
@@ -369,20 +403,78 @@ fn run_combined_node(
     });
 
     if let Some(reward) = reward {
-        println!(
-            "[KRON PHONE] mining to {} — node stays up in this process",
-            reward.as_str()
-        );
-        mine_loop(wallet, reward, hub, p2p, stop)
+        kron_log("KRON MINER", format!("Miner address = {}", reward.as_str()));
+        kron_log("KRON MINER", "Mining started");
+        let miner_wallet = wallet.clone();
+        let miner_hub = hub.clone();
+        let miner_p2p = p2p.clone();
+        let miner_stop = stop.clone();
+        thread::Builder::new()
+            .name("kron-miner".into())
+            .spawn(move || {
+                if let Err(e) = mine_loop(miner_wallet, reward, miner_hub, miner_p2p, miner_stop) {
+                    kron_elog("KRON MINER", e);
+                }
+            })
+            .map_err(|e| format!("miner thread: {e}"))?;
     } else {
-        println!("[KRON PHONE] hub running — second phone: --bootstrap <THIS_IP>:{}", cli.port);
-        while !stop.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(200));
-        }
-        p2p.shutdown();
-        hub.persist_snapshot();
-        Ok(())
+        let hint = match lan {
+            Some(ip) => format!("{ip}:{listen_port}"),
+            None => format!("<this-phone-WiFi-IP>:{listen_port}"),
+        };
+        kron_log(
+            "KRON NODE",
+            format!("hub running — LAN discovery on :{}; or --bootstrap {hint}", listen_port.saturating_add(1)),
+        );
     }
+
+    if !cli.no_discovery {
+        match spawn_lan_discovery(
+            DiscoveryConfig {
+                overlay,
+                kron1: wallet.address().as_str().to_string(),
+                p2p_port: listen_port,
+                lan,
+            },
+            p2p.clone(),
+            hub.clone(),
+            stop.clone(),
+        ) {
+            Ok(()) => kron_log(
+                "KRON NODE",
+                format!(
+                    "LAN discovery beacon :{}",
+                    listen_port.saturating_add(1)
+                ),
+            ),
+            Err(e) => kron_elog("KRON NODE", format!("LAN discovery disabled: {e}")),
+        }
+    }
+
+    let mut last_hb = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        if last_hb.elapsed() >= Duration::from_secs(5) {
+            let dag = hub.lock_dag();
+            let lan_s = match lan {
+                Some(ip) => format!("{ip}:{listen_port}"),
+                None => format!("0.0.0.0:{listen_port} (all interfaces)"),
+            };
+            kron_log(
+                "KRON NODE",
+                format!(
+                    "up lan={lan_s} vertices={} tips={} supply={}",
+                    dag.vertex_count(),
+                    dag.tips().len(),
+                    dag.current_supply
+                ),
+            );
+            last_hb = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    p2p.shutdown();
+    hub.persist_snapshot();
+    Ok(())
 }
 
 fn run_credit(raw: &[String]) -> Result<(), String> {
@@ -391,21 +483,29 @@ fn run_credit(raw: &[String]) -> Result<(), String> {
     let mut data_dir = PathBuf::from("kron-phone");
     let mut i = 0;
     while i < raw.len() {
-        match raw[i].as_str() {
+        let token = sanitize_cli_value(&raw[i]);
+        let (flag, inline) = split_eq_flag(&token);
+        if !flag.starts_with('-') && looks_like_kron1(flag) {
+            to = Some(parse_kron1_arg(flag)?);
+            i += 1;
+            continue;
+        }
+        match flag {
             "--to" => {
-                i += 1;
-                let v = raw.get(i).ok_or("--to requires kron1...")?;
-                to = Some(KronAddress::parse(v).map_err(|e| e.to_string())?);
+                to = Some(parse_kron1_arg(&take_cli_value(
+                    inline,
+                    raw,
+                    &mut i,
+                    "--to",
+                )?)?);
             }
             "--amount" => {
-                i += 1;
-                amount = Some(raw.get(i).ok_or("--amount requires a value")?.clone());
+                amount = Some(take_cli_value(inline, raw, &mut i, "--amount")?);
             }
             "--data-dir" => {
-                i += 1;
-                data_dir = PathBuf::from(raw.get(i).ok_or("--data-dir requires a path")?);
+                data_dir = PathBuf::from(take_cli_value(inline, raw, &mut i, "--data-dir")?);
             }
-            other => return Err(format!("unknown argument: {other}")),
+            other => return Err(unknown_argument(other, CREDIT_FLAGS)),
         }
         i += 1;
     }
@@ -468,38 +568,79 @@ fn mine_loop(
     p2p: Arc<P2pNode>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let dest = *reward.as_bytes();
     let mut attached = 0u64;
+    let mut last_hb = Instant::now()
+        .checked_sub(Duration::from_secs(3))
+        .unwrap_or_else(Instant::now);
     while !stop.load(Ordering::SeqCst) {
-        {
+        let tick = {
             let mut dag = hub.lock_dag();
-            let sender = *wallet.address().as_bytes();
-            let dest = *reward.as_bytes();
-            let bal = dag.balance(&sender);
-            if bal >= FIXED_TRANSACTION_FEE.saturating_add(1) {
-                match dag.compose_and_sign(&wallet, dest, 1) {
-                    Ok(tx) => match dag.attach_and_verify_for(tx.clone(), AttachingDevice::Miner) {
-                        Ok(()) => {
-                            attached = attached.saturating_add(1);
-                            println!(
-                                "[KRON MINER] attached local vertex #{} id={} supply={}",
-                                attached,
-                                hex::encode(tx.id),
-                                dag.current_supply
-                            );
-                            drop(dag);
-                            hub.record_attached(&tx);
-                            let _ = p2p.broadcast(MeshMessage::Vertex(tx));
-                        }
-                        Err(e) => eprintln!("[KRON MINER] local attach failed: {e}"),
-                    },
-                    Err(e) => eprintln!("[KRON MINER] compose failed: {e}"),
-                }
+            miner_tick(&wallet, &mut dag, dest, AttachingDevice::Miner)
+        };
+        if tick.genesis_created {
+            kron_log("KRON MINER", "created local genesis (empty DAG)");
+            {
+                let dag = hub.lock_dag();
+                hub.api().sync_from_dag(&dag);
+            }
+            hub.persist_snapshot();
+        }
+        if tick.faucet_credited > 0 {
+            kron_log(
+                "KRON MINER",
+                format!(
+                    "bootstrap dust {} so the first share can attach (not minted supply)",
+                    tick.faucet_credited
+                ),
+            );
+            hub.persist_snapshot();
+        }
+        if let Some(tx) = tick.tx {
+            attached = attached.saturating_add(1);
+            kron_log(
+                "KRON MINER",
+                format!(
+                    "share #{} id={} tips={} vertices={} supply={}",
+                    attached,
+                    hex::encode(tx.id),
+                    tick.tips,
+                    tick.vertices,
+                    tick.supply
+                ),
+            );
+            hub.record_attached(&tx);
+            let _ = p2p.broadcast(MeshMessage::Vertex(tx));
+        } else if last_hb.elapsed() >= Duration::from_secs(2)
+            || !matches!(tick.status, MinerTickStatus::Attached)
+        {
+            if last_hb.elapsed() >= Duration::from_secs(2)
+                || matches!(
+                    tick.status,
+                    MinerTickStatus::ComposeFailed | MinerTickStatus::AttachFailed
+                )
+            {
+                kron_log(
+                    "KRON MINER",
+                    format!(
+                        "{} tips={} vertices={} supply={} balance={}{}",
+                        tick.status.as_str(),
+                        tick.tips,
+                        tick.vertices,
+                        tick.supply,
+                        tick.balance,
+                        tick.error
+                            .as_deref()
+                            .map(|e| format!(" err={e}"))
+                            .unwrap_or_default()
+                    ),
+                );
+                last_hb = Instant::now();
             }
         }
         thread::sleep(Duration::from_millis(400));
     }
-    p2p.shutdown();
     hub.persist_snapshot();
-    println!("[KRON MINER] shutdown attached={attached}");
+    kron_log("KRON MINER", format!("shutdown attached={attached}"));
     Ok(())
 }

@@ -1,0 +1,2 @@
+# KRON Mesh public hub (paid VPS). Gossip relay — never mines.
+144.91.105.244:8000

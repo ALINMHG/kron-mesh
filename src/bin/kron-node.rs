@@ -1,40 +1,67 @@
 //! KRON Mesh node.
 //!
-//! On a phone (ARM / Termux) this is a full DAG hub: WAL, P2P listen, mesh sync.
-//! On x86 Windows it is a **read-only explorer viewer** — it may follow a phone
-//! to display http://127.0.0.1:8080 but is not a required bootstrap and does
-//! not mint. The network is phones.
+//! * **Listen `0.0.0.0` without `--follow`** — public hub/relay (x86 Linux VPS
+//!   is OK). `--hub` is an alias. Never mines. Phones
+//!   `--bootstrap <VPS_PUBLIC_IP>:8000`.
+//! * **ARM / Termux** — full DAG hub (WAL + P2P). Pair with `kron-phone` to mine.
+//! * **Windows / `--follow` / `--read-only`** — read-only explorer viewer.
+//!   Does not mint. The home PC is not the mesh identity.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use new_blockchain::anti_bot::profile::DeviceClass;
 use new_blockchain::crypto::lattice::LatticeKeyPair;
 use new_blockchain::dag::DagTransaction;
 use new_blockchain::economics::{HARD_CAP, PREMINE, UNITS_PER_COIN};
-use new_blockchain::explorer::start_explorer_http;
+use new_blockchain::kron::cli::{
+    decide_node_run_mode, is_phone_mine_cli_token, looks_like_kron1, parse_kron1_arg,
+    parse_node_cli, sanitize_cli_value, split_eq_flag, take_cli_value, unknown_argument,
+    CREDIT_FLAGS, NODE_MINE_REFUSAL, NodeRunMode,
+};
+use new_blockchain::kron::{
+    default_public_ipv4, is_self_hub_target, resolve_bootstrap, resolve_bootstrap_optional,
+    DEFAULT_BOOTSTRAP, DEFAULT_EXPLORER_URL,
+};
 use new_blockchain::kron::{KronAddress, KronKeypair};
 use new_blockchain::p2p::handshake::HandshakeConfig;
-use new_blockchain::p2p::mesh::{mesh_sync_connect, HubState, MeshGraph, MeshRole};
+use new_blockchain::p2p::mesh::{HubState, MeshGraph};
+use new_blockchain::p2p::overlay::NodeOverlayId;
 use new_blockchain::p2p::peer::PeerRole;
-use new_blockchain::p2p::P2pNode;
+use new_blockchain::p2p::spawn_peer_link;
+use new_blockchain::explorer::start_explorer_http_advertised;
+use new_blockchain::listen::{
+    advertised_public_ipv4, detect_lan_ipv4, format_lan_address_line, format_p2p_listen_line,
+    format_public_explorer_url, is_addr_in_use, log_port_in_use,
+};
+use new_blockchain::p2p::{NetworkError, P2pNode};
 use new_blockchain::persist::{DagSnapshot, DagStore};
 use new_blockchain::types::message::MeshMessage;
+use new_blockchain::{kron_elog, kron_log};
 
 const USAGE: &str = "\
-KRON Mesh node — phones ARE the network. The PC is an optional explorer.
+KRON Mesh node — phones mine. A paid VPS listens; phones connect inbound.
+
+VPS (x86 Linux OK) — gossip relay + explorer. Never mines. No --follow:
+  kron-node --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
+  kron-node --hub --port 8000 --explorer-port 8080 --data-dir /var/lib/kron
+  # ufw allow 8000 && ufw allow 8080
+  # phones: kron-phone --mine --reward-address kron1...   (dials this hub by default)
+  # browser: http://144.91.105.244:8080
+  # tmux: tmux attach -t kron   OR   tmux new -s kron2
+  #        tmux kill-session -t kron && tmux new -s kron
 
 PHONE (Termux / ARM) — full hub (WAL + P2P + kron-mesh/1). Pair with kron-phone to mine:
   kron-node --port 8000
-  kron-node --port 8000 --bootstrap <OTHER_PHONE_IP>:8000
+  kron-node --port 8000 --bootstrap 144.91.105.244:8000
 
-PC (Windows x86) — read-only viewer (default). Does not mint. Offline PC does not
-block the mesh. Follow a phone to populate the explorer:
-  kron-node --follow <PHONE_IP>:8000 --explorer-port 8080 --read-only
+PC (Windows) — read-only viewer. Does not mint. Requires --follow:
+  kron-node --follow 144.91.105.244:8000 --explorer-port 8080 --read-only
+  # or --follow <PHONE_LAN_IP>:8000
+  # public explorer: http://144.91.105.244:8080
 
 USAGE
   kron-node [options]
@@ -43,18 +70,24 @@ USAGE
   kron-node --help
 
 OPTIONS
-  --port PORT                 Listen port (default 8000; phone hub / optional viewer)
-  --follow IP:PORT            Pull vertices from a phone (alias: --bootstrap)
-  --bootstrap IP:PORT         Another *phone* hub, never a required PC
+  --hub                       Public gossip relay (VPS). Alias of: listen, no --follow
+  --port PORT                 Listen port (default 8000). Binds 0.0.0.0
+  --follow IP:PORT            Viewer pull (alias: --bootstrap). Optional on --hub
+  --bootstrap IP:PORT         VPS or another hub (also KRON_BOOTSTRAP / bootstrap.txt)
+  --public-ip IPV4            Printed explorer / wait-for-phones host
   --data-dir DIR              Persist identity, WAL, snapshot
   --name NAME                 Label used in logs
-  --explorer-port PORT        Local explorer HTTP (default 8080 on PC)
-  --read-only                 Viewer mode (default on x86)
-  --no-mine                   Explicit: this process never mines
-  --print-identity            Create/load identity, print kron1, exit
+  --explorer-port PORT        Explorer HTTP (default 8080, binds 0.0.0.0)
+  --read-only                 Viewer mode (home PC; use with --follow)
+  --no-mine                   Explicit: this process never mines (hub still relays)
+  --no-discovery              Disable LAN UDP beacons (default off on --hub / viewer)
+  --print-identity            Create/load identity, print kron1 + Mesh ID, exit
   --help                      Show this help
 
-Wallet broadcast: KRON_GATEWAY=<PHONE_IP>:8000 (default 127.0.0.1:8000).
+Mining flags (--mine, --reward-address, --miner-address, positional kron1...)
+are rejected here. Use Termux: kron-phone --mine --reward-address kron1...
+
+Wallet broadcast: KRON_GATEWAY=144.91.105.244:8000 (default 127.0.0.1:8000).
 Economics: HARD_CAP 24_000_000 KRON, PREMINE=0, fee=0.001 KRON, 0.1 KRON/tx,
 80% miner phone / 20% relays, halving every 126_144_000 txs.
 ";
@@ -66,7 +99,12 @@ struct Args {
     follow: Option<SocketAddr>,
     name: String,
     print_identity: bool,
-    read_only: bool,
+    /// Home-PC viewer: no gossip fan-out.
+    viewer: bool,
+    /// Paid VPS / public relay: gossip + WAL, never mines.
+    public_hub: bool,
+    /// Host printed in explorer / wait-for-phones lines (never 0.0.0.0).
+    public_ip: Ipv4Addr,
 }
 
 fn is_pc_viewer() -> bool {
@@ -86,94 +124,70 @@ fn run() -> Result<(), String> {
         print!("{USAGE}");
         return Ok(());
     }
-    if raw.iter().any(|a| a == "--mine" || a == "--miner-only" || a == "--miner-ui") {
-        return Err(
-            "mining is phone-only. On Termux run kron-phone (node+miner). This PC is a read-only explorer."
-                .into(),
-        );
-    }
     if raw.first().map(|s| s.as_str()) == Some("send") {
         return run_send(&raw[1..]);
     }
     if raw.first().map(|s| s.as_str()) == Some("credit") {
         return run_credit(&raw[1..]);
     }
+    if raw.iter().any(|a| is_phone_mine_cli_token(a)) {
+        return Err(NODE_MINE_REFUSAL.into());
+    }
     let args = parse_args(&raw)?;
     if args.print_identity {
         let (wallet, created) = load_or_create_identity(&args.data_dir)?;
+        let overlay = NodeOverlayId::from_pubkey(wallet.public_key());
         println!("[KRON INFO] data-dir {}", args.data_dir.display());
         println!(
             "[KRON INFO] identity {} ({})",
             wallet.address().as_str(),
             if created { "created" } else { "loaded" }
         );
+        println!("[KRON INFO] Mesh ID: {}", overlay.to_ula());
         return Ok(());
     }
     run_gateway(args)
 }
 
 fn parse_args(raw: &[String]) -> Result<Args, String> {
-    let mut port = 8000u16;
-    let mut explorer_port = 8080u16;
-    let mut data_dir = None;
-    let mut follow = None;
-    let pc = is_pc_viewer();
-    let mut name = if pc {
-        String::from("viewer")
-    } else {
-        String::from("phone-hub")
-    };
-    let mut print_identity = false;
-    let mut read_only = pc;
-    let mut i = 0;
-    while i < raw.len() {
-        match raw[i].as_str() {
-            "--port" => {
-                i += 1;
-                port = raw
-                    .get(i)
-                    .ok_or("--port requires a value")?
-                    .parse()
-                    .map_err(|_| "invalid --port")?;
-            }
-            "--explorer-port" => {
-                i += 1;
-                explorer_port = raw
-                    .get(i)
-                    .ok_or("--explorer-port requires a value")?
-                    .parse()
-                    .map_err(|_| "invalid --explorer-port")?;
-            }
-            "--data-dir" => {
-                i += 1;
-                data_dir = Some(PathBuf::from(raw.get(i).ok_or("--data-dir requires a path")?));
-            }
-            "--follow" | "--bootstrap" | "--node" => {
-                i += 1;
-                let v = raw.get(i).ok_or("--follow/--bootstrap requires IP:PORT")?;
-                follow = Some(v.parse().map_err(|_| format!("invalid peer '{v}'"))?);
-            }
-            "--name" => {
-                i += 1;
-                name = raw.get(i).ok_or("--name requires a value")?.clone();
-            }
-            "--read-only" | "--no-mine" => read_only = true,
-            "--print-identity" => print_identity = true,
-            other => return Err(format!("unknown argument: {other}")),
+    let parsed = parse_node_cli(raw)?;
+    let mode = decide_node_run_mode(
+        parsed.public_hub,
+        parsed.read_only,
+        parsed.follow.is_some(),
+        is_pc_viewer(),
+    );
+    let public_hub = mode == NodeRunMode::PublicHub;
+    let viewer = mode == NodeRunMode::Viewer;
+    let name = parsed.name.unwrap_or_else(|| {
+        if public_hub {
+            String::from("vps-hub")
+        } else if viewer {
+            String::from("viewer")
+        } else {
+            String::from("phone-hub")
         }
-        i += 1;
-    }
-    if pc {
-        read_only = true;
-    }
+    });
+    let data_dir = parsed
+        .data_dir
+        .unwrap_or_else(|| default_data_dir(parsed.port));
+    // VPS hub is the public entry — do not dial itself. Phones/viewers default to it.
+    let follow = if public_hub {
+        resolve_bootstrap_optional(parsed.follow, &data_dir)?
+    } else {
+        resolve_bootstrap(parsed.follow, &data_dir)?
+    };
+    let public_ip = advertised_public_ipv4(parsed.public_ip, default_public_ipv4());
     Ok(Args {
-        port,
-        explorer_port,
-        data_dir: data_dir.unwrap_or_else(|| default_data_dir(port)),
+        port: parsed.port,
+        explorer_port: parsed.explorer_port,
+        data_dir,
         follow,
         name,
-        print_identity,
-        read_only,
+        print_identity: parsed.print_identity,
+        viewer,
+        public_hub,
+        public_ip,
     })
 }
 
@@ -193,59 +207,87 @@ fn run_gateway(args: Args) -> Result<(), String> {
     let (dag, snap) = store.load().map_err(|e| e.to_string())?;
     let faucet = snap.faucet.clone();
 
-    let role_label = if args.read_only {
-        "VIEWER"
+    let role_label = if args.public_hub {
+        "KRON HUB"
+    } else if args.viewer {
+        "KRON VIEWER"
     } else {
-        "HUB"
+        "KRON NODE"
     };
-    println!(
-        "[KRON {role_label}] {} identity {} ({}) data-dir {}",
-        args.name,
-        wallet.address().as_str(),
-        if created { "created" } else { "loaded" },
-        args.data_dir.display()
+    kron_log(
+        role_label,
+        format!(
+            "{} identity {} ({}) data-dir {}",
+            args.name,
+            wallet.address().as_str(),
+            if created { "created" } else { "loaded" },
+            args.data_dir.display()
+        ),
     );
-    println!(
-        "[KRON {role_label}] DAG vertices={} tips={} txs={} supply={} HARD_CAP={} PREMINE={}",
-        dag.vertex_count(),
-        dag.tips().len(),
-        dag.dag_tx_count,
-        dag.current_supply,
-        HARD_CAP,
-        PREMINE
+    kron_log(
+        role_label,
+        format!(
+            "DAG vertices={} tips={} txs={} supply={} HARD_CAP={} PREMINE={}",
+            dag.vertex_count(),
+            dag.tips().len(),
+            dag.dag_tx_count,
+            dag.current_supply,
+            HARD_CAP,
+            PREMINE
+        ),
     );
-    if args.read_only {
-        println!(
-            "[KRON VIEWER] read-only explorer — phones are the network; this PC is optional"
+    let overlay = NodeOverlayId::from_pubkey(wallet.public_key());
+    let explorer_url = format_public_explorer_url(args.public_ip, args.explorer_port);
+    if args.public_hub {
+        kron_log(
+            role_label,
+            "public hub — gossip relay + explorer; this process never mines",
+        );
+        kron_log(
+            role_label,
+            format!(
+                "waiting for phones to connect to {}:{}",
+                args.public_ip, args.port
+            ),
+        );
+        kron_log(
+            role_label,
+            format!("phones dial {DEFAULT_BOOTSTRAP} (no --bootstrap required)"),
+        );
+        kron_log(role_label, DEFAULT_EXPLORER_URL);
+    } else if args.viewer {
+        kron_log(
+            role_label,
+            "read-only explorer — phones mine; this PC is optional",
         );
     }
 
-    let (p2p_role, class) = if args.read_only {
+    let (p2p_role, class) = if args.public_hub || args.viewer {
         (PeerRole::CoreValidator, DeviceClass::PersonalComputer)
     } else {
         (PeerRole::EdgeMiner, DeviceClass::LegacyMobile)
     };
     let hs = HandshakeConfig::honest(identity, p2p_role, class, false);
     let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
-    let p2p = P2pNode::bind_on(hs, bind).map_err(|e| format!("P2P bind failed: {e}"))?;
-    println!(
-        "[KRON {role_label}] listen {} (0.0.0.0:{}) kron-mesh/1",
-        p2p.addr, args.port
-    );
-
-    if let Some(peer) = args.follow {
-        match p2p.connect(peer) {
-            Ok(info) => println!(
-                "[KRON {role_label}] following {peer} authenticity={}",
-                info.score.authenticity
-            ),
-            Err(e) => eprintln!("[KRON {role_label}] follow {peer} failed: {e}"),
+    let p2p = match P2pNode::bind_on(hs, bind) {
+        Ok(p2p) => p2p,
+        Err(NetworkError::Io(e)) if is_addr_in_use(&e) => {
+            log_port_in_use(role_label, "P2P", args.port, "--port", Some(&e));
+            return Err("P2P port already in use".into());
         }
-    } else if args.read_only {
-        println!("[KRON VIEWER] no --follow <PHONE_IP>:8000 — explorer stays empty until a phone is followed");
+        Err(e) => return Err(format!("P2P bind failed: {e}")),
+    };
+    let lan = detect_lan_ipv4();
+    kron_log(role_label, format_p2p_listen_line(args.port));
+    kron_log(role_label, format!("Mesh ID: {}", overlay.to_ula()));
+    kron_log(role_label, wallet.address().as_str());
+    kron_log(role_label, format_lan_address_line(lan, args.port));
+    if args.public_hub {
+        kron_log("KRON EXPLORER", &explorer_url);
     }
 
-    if !args.read_only {
+    let gossip_out = args.public_hub || !args.viewer;
+    if gossip_out {
         for tx in dag.transactions_in_order() {
             if !tx.is_genesis() {
                 let _ = p2p.broadcast(MeshMessage::Vertex(tx));
@@ -264,43 +306,75 @@ fn run_gateway(args: Args) -> Result<(), String> {
 
     let stop = Arc::new(AtomicBool::new(false));
     install_ctrl_c(stop.clone());
-    let explorer_addr = start_explorer_http(hub.explorer_api(), args.explorer_port, stop.clone())
-        .map_err(|e| format!("explorer bind: {e}"))?;
-    println!("[KRON {role_label}] explorer http://{explorer_addr}");
-
-    if let Some(peer) = args.follow {
-        match mesh_sync_connect(peer, hub.clone(), MeshRole::Hub) {
-            Ok(()) => println!(
-                "[KRON {role_label}] mesh sync with {peer} vertices={}",
-                hub.lock_dag().vertex_count()
-            ),
-            Err(e) => eprintln!("[KRON {role_label}] mesh sync {peer} failed: {e}"),
-        }
-        let hub_bg = hub.clone();
-        let stop_bg = stop.clone();
-        thread::spawn(move || {
-            while !stop_bg.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(500));
-                let _ = mesh_sync_connect(peer, hub_bg.clone(), MeshRole::Hub);
-            }
-        });
-    }
+    let advertised = if args.public_hub {
+        Some(args.public_ip)
+    } else {
+        None
+    };
+    let explorer_addr = match start_explorer_http_advertised(
+        hub.explorer_api(),
+        args.explorer_port,
+        stop.clone(),
+        advertised,
+    ) {
+        Ok(addr) => addr,
+        Err(e) if is_addr_in_use(&e) => return Err("explorer port already in use".into()),
+        Err(e) => return Err(format!("explorer bind: {e}")),
+    };
 
     let p2p = Arc::new(p2p);
-    let gossip_out = !args.read_only;
-
+    if let Some(peer) = args.follow {
+        if is_self_hub_target(peer, args.port, Some(args.public_ip), lan) {
+            kron_log(
+                role_label,
+                format!("skip self-dial {peer} (this process is the hub)"),
+            );
+        } else {
+            kron_log(
+                role_label,
+                format!("following {peer} (gossip client in background)"),
+            );
+            spawn_peer_link(p2p.clone(), hub.clone(), peer, stop.clone(), "follow");
+        }
+    } else if args.viewer {
+        kron_log(
+            role_label,
+            format!("no --follow — open {explorer_url} or --follow {DEFAULT_BOOTSTRAP}"),
+        );
+    }
+    let mut last_hb = Instant::now();
     while !stop.load(Ordering::SeqCst) {
         for (_from, msg) in p2p.take_delivered_from() {
             let MeshMessage::Vertex(tx) = msg;
             if let Err(e) = ingest_hub(&hub, &p2p, tx, gossip_out) {
-                eprintln!("[KRON {role_label}] drop vertex: {e}");
+                kron_elog(role_label, format!("drop vertex: {e}"));
             }
         }
-        thread::sleep(Duration::from_millis(40));
+        if last_hb.elapsed() >= Duration::from_secs(5) {
+            let dag = hub.lock_dag();
+            let explorer = if args.public_hub {
+                explorer_url.clone()
+            } else {
+                match lan {
+                    Some(ip) => format!("http://{ip}:{}", explorer_addr.port()),
+                    None => format!("http://127.0.0.1:{}", explorer_addr.port()),
+                }
+            };
+            kron_log(
+                role_label,
+                format!(
+                    "up explorer={explorer} vertices={} tips={}",
+                    dag.vertex_count(),
+                    dag.tips().len()
+                ),
+            );
+            last_hb = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(40));
     }
     p2p.shutdown();
     hub.persist_snapshot();
-    println!("[KRON {role_label}] shutdown");
+    kron_log(role_label, "shutdown");
     Ok(())
 }
 
@@ -351,25 +425,39 @@ fn parse_money_cmd(raw: &[String]) -> Result<(KronAddress, String, u16, PathBuf)
     let mut data_dir = None;
     let mut i = 0;
     while i < raw.len() {
-        match raw[i].as_str() {
+        let token = sanitize_cli_value(&raw[i]);
+        let (flag, inline) = split_eq_flag(&token);
+        if !flag.starts_with('-') && looks_like_kron1(flag) {
+            to = Some(parse_kron1_arg(flag)?);
+            i += 1;
+            continue;
+        }
+        match flag {
             "--to" => {
-                i += 1;
-                let v = raw.get(i).ok_or("--to requires kron1...")?;
-                to = Some(KronAddress::parse(v).map_err(|e| e.to_string())?);
+                to = Some(parse_kron1_arg(&take_cli_value(
+                    inline,
+                    raw,
+                    &mut i,
+                    "--to",
+                )?)?);
             }
             "--amount" => {
-                i += 1;
-                amount = Some(raw.get(i).ok_or("--amount requires a value")?.clone());
+                amount = Some(take_cli_value(inline, raw, &mut i, "--amount")?);
             }
             "--port" => {
-                i += 1;
-                port = raw.get(i).ok_or("--port requires a value")?.parse().map_err(|_| "invalid --port")?;
+                port = take_cli_value(inline, raw, &mut i, "--port")?
+                    .parse()
+                    .map_err(|_| "invalid --port")?;
             }
             "--data-dir" => {
-                i += 1;
-                data_dir = Some(PathBuf::from(raw.get(i).ok_or("--data-dir requires a path")?));
+                data_dir = Some(PathBuf::from(take_cli_value(
+                    inline,
+                    raw,
+                    &mut i,
+                    "--data-dir",
+                )?));
             }
-            other => return Err(format!("unknown argument: {other}")),
+            other => return Err(unknown_argument(other, CREDIT_FLAGS)),
         }
         i += 1;
     }

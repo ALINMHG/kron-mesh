@@ -104,10 +104,21 @@ impl KronDAG {
     /// Insert the IOTA-style genesis vertex (dummy [`NULL_PARENT`] pair, fee 0).
     pub fn with_genesis() -> Self {
         let mut dag = Self::new();
-        let genesis = signed_genesis_tx();
-        dag.attach_and_verify_tx(genesis)
-            .expect("protocol genesis must attach");
+        dag.ensure_genesis();
         dag
+    }
+
+    /// Attach protocol genesis when the local graph has no vertices.
+    ///
+    /// Returns `true` when genesis was created. Safe to call on a loaded DAG.
+    pub fn ensure_genesis(&mut self) -> bool {
+        if !self.vertices.is_empty() {
+            return false;
+        }
+        let genesis = signed_genesis_tx();
+        self.attach_and_verify_tx(genesis)
+            .expect("protocol genesis must attach");
+        true
     }
 
     pub fn genesis_id(&self) -> TxHash {

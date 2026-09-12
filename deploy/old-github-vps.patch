@@ -1,0 +1,28 @@
+--- a/src/bin/kron-node.rs
++++ b/src/bin/kron-node.rs
+@@ -157,6 +157,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
+                 i += 1;
+                 name = raw.get(i).ok_or("--name requires a value")?.clone();
+             }
++            "--hub" => {}
+             "--read-only" | "--no-mine" => read_only = true,
+             "--print-identity" => print_identity = true,
+             other => return Err(format!("unknown argument: {other}")),
+--- a/src/explorer/http.rs
++++ b/src/explorer/http.rs
+@@ -14,13 +14,13 @@ use crate::explorer::get_kron_asset_metadata;
+ 
+ const UI: &str = include_str!("ui.html");
+ 
+-/// Bind `127.0.0.1:port` and serve the explorer until `stop` is set.
++/// Bind `0.0.0.0:port` and serve the explorer until `stop` is set.
+ pub fn start_explorer_http(
+     api: Arc<Mutex<ExplorerApi>>,
+     port: u16,
+     stop: Arc<AtomicBool>,
+ ) -> Result<SocketAddr, std::io::Error> {
+-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
++    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+     let listener = TcpListener::bind(addr)?;
+     listener.set_nonblocking(true)?;
+     let bound = listener.local_addr()?;

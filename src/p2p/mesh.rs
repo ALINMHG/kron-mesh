@@ -579,17 +579,24 @@ pub fn run_sync_round(
             MeshWireMessage::Need { ids } => ids,
             _ => return Err(NetworkError::BadFrame),
         };
-        let _their_have = match read_msg(stream)? {
+        let their_have = match read_msg(stream)? {
             MeshWireMessage::Have { ids } => ids,
             _ => return Err(NetworkError::BadFrame),
         };
-        let (need, _have) = graph.need_and_have(&remote);
+        let (mut need, _have) = graph.need_and_have(&remote);
+        for id in their_have {
+            if !graph.contains(&id) && !need.contains(&id) {
+                need.push(id);
+            }
+        }
         write_msg(stream, &MeshWireMessage::Need { ids: need })?;
         for tx in graph.bodies_in_order(&their_need) {
             write_msg(stream, &MeshWireMessage::DagTransaction(tx))?;
         }
-        write_msg(stream, &MeshWireMessage::Done)?;
-        recv_bodies_until_done(stream, graph)
+        // Recv phone vertices before Done. A premature Done lets the miner
+        // drop the socket (TCP RST) and the hub never merges inbound shares.
+        recv_bodies_until_done(stream, graph)?;
+        write_msg(stream, &MeshWireMessage::Done)
     }
 }
 
@@ -646,7 +653,7 @@ pub fn mesh_sync_connect(
     graph: Arc<dyn MeshGraph>,
     role: MeshRole,
 ) -> Result<(), NetworkError> {
-    let mut stream = TcpStream::connect(addr)?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     configure_socket(&mut stream)?;
     send_hello(&mut stream, role)?;
     let _ = expect_hello(&mut stream)?;
@@ -655,7 +662,7 @@ pub fn mesh_sync_connect(
 
 /// Wallet broadcast: send a signed vertex to `127.0.0.1:8000` (or `KRON_GATEWAY`).
 pub fn broadcast_wallet_tx(addr: SocketAddr, tx: &DagTransaction) -> Result<(), NetworkError> {
-    let mut stream = TcpStream::connect(addr)?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     configure_socket(&mut stream)?;
     send_hello(&mut stream, MeshRole::Wallet)?;
     let _ = expect_hello(&mut stream)?;

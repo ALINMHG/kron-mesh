@@ -1,6 +1,7 @@
 //! From-scratch P2P overlay (no libp2p): Kademlia-style routing, lattice
 //! handshake, and Have/Need gossip of DAG vertices.
 
+pub mod discovery;
 pub mod error;
 pub mod frame;
 pub mod gossip;
@@ -8,10 +9,16 @@ pub mod handshake;
 pub mod mesh;
 pub mod noise;
 pub mod node;
+pub mod overlay;
 pub mod peer;
 pub mod routing;
 pub mod wire;
 
+pub use discovery::{
+    beacon_port, decode_beacon, encode_beacon, format_hub_connect_error, spawn_hub_dial,
+    spawn_lan_discovery, spawn_peer_link, DiscoveredPeer, DiscoveryConfig, LanBeacon,
+    LanBeaconSocket,
+};
 pub use error::NetworkError;
 pub use gossip::{accept_udp_inventory, GossipEngine, GossipInventory};
 pub use handshake::{perform_secure_handshake, HandshakeConfig};
@@ -20,6 +27,7 @@ pub use mesh::{
     IsolatedDag, MeshGraph, MeshRole, MeshWireMessage, PROTOCOL_KRON_MESH,
 };
 pub use node::P2pNode;
+pub use overlay::NodeOverlayId;
 pub use peer::{Peer, PeerInfo, PeerRole};
 pub use routing::RoutingTable;
 pub use wire::{encode_mesh, message_id};

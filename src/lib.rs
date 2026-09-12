@@ -12,6 +12,7 @@ pub mod dag;
 pub mod economics;
 pub mod explorer;
 pub mod kron;
+pub mod listen;
 pub mod p2p;
 pub mod persist;
 pub mod shield;
@@ -40,17 +41,33 @@ pub use dag::{
 };
 pub use kron::{
     derive_kron_address, generate_kron_wallet, generate_kron_wallet_from_rng, get_kron_metadata,
-    run_active_miner_loop, sign_transaction_natively, start_wallet_relay_service,
+    miner_tick, run_active_miner_loop, sign_transaction_natively, start_wallet_relay_service,
     verify_transaction_signature, AssetMetadata, KronAddress, KronKeypair, KronVisualSpec,
-    KronWallet, MinerLoopOutcome, NETWORK_NAME, TICKER,
+    KronWallet, MinerLoopOutcome, MinerTickOutcome, MinerTickStatus, NETWORK_NAME, TICKER,
 };
 pub use p2p::{
     broadcast_wallet_tx, default_gateway_addr, mesh_sync_connect, perform_secure_handshake,
-    GossipInventory, HubState, IsolatedDag, MeshGraph, MeshRole, MeshWireMessage, P2pNode, Peer,
-    RoutingTable, PROTOCOL_KRON_MESH,
+    GossipInventory, HubState, IsolatedDag, MeshGraph, MeshRole, MeshWireMessage, NodeOverlayId,
+    P2pNode, Peer, RoutingTable, PROTOCOL_KRON_MESH,
 };
 pub use explorer::{
     get_kron_asset_metadata, ExplorerApi, ExplorerEngine, FeeSplit, IndexedTransaction,
     IndexedVertex, MeshState, NetworkStats, TxHash, WalletSnapshot,
 };
 pub use persist::{DagSnapshot, DagStore, WalRecord};
+
+/// Line + flush so Termux / redirected stdout shows progress immediately.
+pub fn kron_log(prefix: &str, msg: impl std::fmt::Display) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "[{prefix}] {msg}");
+    let _ = out.flush();
+}
+
+/// Same as [`kron_log`] on stderr (errors, bind failures).
+pub fn kron_elog(prefix: &str, msg: impl std::fmt::Display) {
+    use std::io::Write;
+    let mut out = std::io::stderr();
+    let _ = writeln!(out, "[{prefix}] {msg}");
+    let _ = out.flush();
+}

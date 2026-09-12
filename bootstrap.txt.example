@@ -1,0 +1,2 @@
+# Copy to bootstrap.txt (or set KRON_BOOTSTRAP). Phones default to this VPS.
+144.91.105.244:8000

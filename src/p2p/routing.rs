@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use crate::p2p::error::NetworkError;
+use crate::p2p::overlay::NodeOverlayId;
 use crate::p2p::peer::{ipv4_octets, slash24, ConnectionState, Peer, PeerRole};
 use crate::types::Address;
 
@@ -21,6 +22,7 @@ const MIN_CORE_ANCHORS: usize = 4;
 #[derive(Debug)]
 pub struct RoutingTable {
     local_id: Address,
+    local_overlay: NodeOverlayId,
     local_role: PeerRole,
     core: Vec<VecDeque<Peer>>,
     edge: Vec<VecDeque<Peer>>,
@@ -30,6 +32,7 @@ impl RoutingTable {
     pub fn new(local_id: Address, local_role: PeerRole) -> Self {
         Self {
             local_id,
+            local_overlay: NodeOverlayId::from_address(&local_id),
             local_role,
             core: vec![VecDeque::with_capacity(K); BUCKETS],
             edge: vec![VecDeque::with_capacity(K); BUCKETS],
@@ -40,10 +43,15 @@ impl RoutingTable {
         self.local_id
     }
 
+    pub fn local_overlay(&self) -> NodeOverlayId {
+        self.local_overlay
+    }
+
     pub fn insert(&mut self, mut peer: Peer) -> Result<(), NetworkError> {
-        if peer.id == self.local_id {
+        if peer.id == self.local_id || peer.overlay_id == self.local_overlay {
             return Err(NetworkError::RoutingDenied);
         }
+        self.remove_overlay(&peer.overlay_id);
         peer.last_seen = Instant::now();
         peer.state = ConnectionState::Live;
         let idx = bucket_index(&self.local_id, &peer.id);
@@ -189,11 +197,35 @@ impl RoutingTable {
         self.live_peers().iter().any(|p| p.id == *id)
     }
 
+    pub fn contains_overlay(&self, id: &NodeOverlayId) -> bool {
+        *id == self.local_overlay
+            || self.live_peers().iter().any(|p| p.overlay_id == *id)
+    }
+
     pub fn lookup_addr(&self, id: &Address) -> Option<SocketAddr> {
         self.live_peers()
             .into_iter()
             .find(|p| p.id == *id)
             .map(|p| p.addr)
+    }
+
+    /// Socket is transport only. Identity is the Mesh ID.
+    pub fn lookup_overlay(&self, id: &NodeOverlayId) -> Option<SocketAddr> {
+        self.live_peers()
+            .into_iter()
+            .find(|p| p.overlay_id == *id)
+            .map(|p| p.addr)
+    }
+
+    fn remove_overlay(&mut self, id: &NodeOverlayId) {
+        for table in [&mut self.core, &mut self.edge] {
+            for bucket in table.iter_mut() {
+                if let Some(pos) = bucket.iter().position(|p| p.overlay_id == *id) {
+                    bucket.remove(pos);
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -236,6 +268,7 @@ mod tests {
         let keys = LatticeKeyPair::generate(&mut rng);
         Peer {
             id: keys.public.address(),
+            overlay_id: crate::p2p::overlay::NodeOverlayId::from_pubkey(&keys.public),
             public_key: keys.public,
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), 9000),
             role,
@@ -275,5 +308,27 @@ mod tests {
         assert_eq!(table.core_count(), 4);
         let closest = table.closest(&[0xFFu8; 32], 8);
         assert!(closest.iter().any(|p| p.role == PeerRole::CoreValidator));
+    }
+
+    #[test]
+    fn lookup_is_by_overlay_id_not_lan_ip() {
+        let local = [0x22u8; 32];
+        let mut table = RoutingTable::new(local, PeerRole::EdgeMiner);
+        let p = peer_at(3, [192, 168, 1, 50], PeerRole::EdgeMiner);
+        let overlay = p.overlay_id;
+        table.insert(p).unwrap();
+        assert!(table.contains_overlay(&overlay));
+        assert_eq!(
+            table.lookup_overlay(&overlay).map(|a| a.ip().to_string()),
+            Some("192.168.1.50".into())
+        );
+        let moved = peer_at(3, [10, 0, 0, 9], PeerRole::EdgeMiner);
+        assert_eq!(moved.overlay_id, overlay);
+        table.insert(moved).unwrap();
+        assert_eq!(table.edge_count(), 1);
+        assert_eq!(
+            table.lookup_overlay(&overlay).map(|a| a.ip().to_string()),
+            Some("10.0.0.9".into())
+        );
     }
 }

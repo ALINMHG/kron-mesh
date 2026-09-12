@@ -10,6 +10,7 @@ use crate::anti_bot::profile::{DeviceClass, HardwareProfile};
 use crate::p2p::error::NetworkError;
 use crate::p2p::frame::{KIND_ACK, KIND_AUTH, KIND_CHALLENGE, KIND_HELLO, KIND_REJECT};
 use crate::p2p::noise::NoiseSession;
+use crate::p2p::overlay::NodeOverlayId;
 use crate::p2p::peer::{ipv4_octets, is_loopback, ConnectionState, Peer, PeerInfo, PeerRole};
 use crate::types::Address;
 
@@ -28,6 +29,10 @@ pub struct HandshakeConfig {
 impl HandshakeConfig {
     pub fn peer_id(&self) -> Address {
         self.keys.public.address()
+    }
+
+    pub fn overlay_id(&self) -> NodeOverlayId {
+        NodeOverlayId::from_pubkey(&self.keys.public)
     }
 
     pub fn honest(
@@ -301,6 +306,7 @@ fn info_from(
     PeerInfo {
         peer: Peer {
             id: pk.address(),
+            overlay_id: NodeOverlayId::from_pubkey(&pk),
             public_key: pk,
             addr,
             role,

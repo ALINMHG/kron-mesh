@@ -102,6 +102,8 @@ impl KronAddress {
     }
 
     /// Parse a `kron1…` string. Accepts all-lower or all-upper (BIP-173).
+    /// Whitespace, newlines, and zero-width marks are stripped so a Termux
+    /// wrap (`kron1…` split across lines) still parses.
     pub fn parse(s: &str) -> Result<Self, Bech32Error> {
         let bytes = decode_kron(s)?;
         // Re-encode so the stored string is the canonical lowercase form.
@@ -256,6 +258,11 @@ mod tests {
         let parsed = KronAddress::parse(&encoded).expect("round-trip parse");
         assert_eq!(parsed.as_bytes(), &wallet.public_key().address());
         assert_eq!(parsed.as_str(), encoded.as_str());
+        let pasted = format!("\r\n{encoded} \n");
+        assert_eq!(
+            KronAddress::parse(&pasted).expect("trim paste").as_str(),
+            encoded.as_str()
+        );
 
         // Native fee is 0.001 KRON = 1_000 Satoshi-KRON (ledger charges on apply).
         assert_eq!(FIXED_TRANSACTION_FEE, 1_000);
@@ -293,6 +300,49 @@ mod tests {
         let meta = get_kron_metadata();
         assert_eq!(meta.ticker, "KRON");
         assert_eq!(meta.name, "KRON Network");
+    }
+
+    #[test]
+    fn generate_derive_parse_same_bytes() {
+        let wallet = generate_kron_wallet();
+        let encoded = derive_kron_address(wallet.public_key());
+        assert!(encoded.starts_with("kron1"));
+        assert_eq!(encoded.len(), crate::kron::bech32::KRON1_LEN);
+        let parsed = KronAddress::parse(&encoded).expect("derive → parse");
+        assert_eq!(parsed.as_bytes(), &wallet.public_key().address());
+        assert_eq!(parsed.as_str(), encoded);
+    }
+
+    #[test]
+    fn whitespace_wrapped_paste_still_parses() {
+        let wallet = generate_kron_wallet();
+        let encoded = derive_kron_address(wallet.public_key());
+        let mut wrapped = String::new();
+        for (i, ch) in encoded.chars().enumerate() {
+            if i > 0 && i % 16 == 0 {
+                wrapped.push_str(" \n");
+            }
+            wrapped.push(ch);
+        }
+        let parsed = KronAddress::parse(&wrapped).expect("wrapped Termux paste");
+        assert_eq!(parsed.as_bytes(), &wallet.public_key().address());
+        assert_eq!(parsed.as_str(), encoded);
+    }
+
+    #[test]
+    fn truncated_address_fails_clearly() {
+        let wallet = generate_kron_wallet();
+        let encoded = derive_kron_address(wallet.public_key());
+        let truncated = &encoded[..40];
+        let err = KronAddress::parse(truncated).expect_err("truncated must fail");
+        assert_eq!(err, Bech32Error::InvalidChecksum);
+        let msg = err.to_string();
+        assert!(msg.contains("63"), "{msg}");
+        assert!(msg.contains("one line"), "{msg}");
+        let cli = err.cli_message(truncated);
+        assert!(cli.contains("40"), "{cli}");
+        assert!(cli.contains("63"), "{cli}");
+        assert!(cli.contains("one line"), "{cli}");
     }
 
     #[test]

@@ -16,6 +16,10 @@ use new_blockchain::crypto::lattice::LatticeKeyPair;
 use new_blockchain::crypto::mobile_only::enforce_real_mobile;
 use new_blockchain::dag::{AttachingDevice, KronDAG};
 use new_blockchain::economics::FIXED_TRANSACTION_FEE;
+use new_blockchain::kron::cli::{
+    looks_like_kron1, parse_kron1_arg, sanitize_cli_value, split_eq_flag, take_cli_value,
+    unknown_argument, PHONE_MINER_FLAGS,
+};
 use new_blockchain::kron::{KronAddress, KronKeypair};
 use new_blockchain::p2p::handshake::HandshakeConfig;
 use new_blockchain::p2p::peer::PeerRole;
@@ -27,12 +31,17 @@ KRON phone miner (Termux / Linux) — attach DAG vertices, not ACS blocks
 
 USAGE
   kron-phone-miner --phone --reward-address kron1... [--node IP:PORT]
+  kron-phone-miner --phone --miner-address kron1...
+  kron-phone-miner --phone --mine kron1...
+  kron-phone-miner --phone kron1...
 
 OPTIONS
   --phone                     Required. Interim flag: this process attests as LegacyMobile.
   --node IP:PORT              Gateway to attach to (default 127.0.0.1:8000)
   --bootstrap IP:PORT         Alias of --node
   --reward-address kron1...   Destination for self-attached mesh txs
+  --miner-address kron1...    Alias of --reward-address
+  --mine                      Optional; a following kron1... is the reward address
   --data-dir DIR              Local signing identity (default kron-phone-miner)
   --help                      Show this help
 
@@ -203,36 +212,46 @@ fn parse_cli() -> Result<Cli, String> {
     let mut phone = false;
     let mut i = 0;
     while i < raw.len() {
-        match raw[i].as_str() {
+        let token = sanitize_cli_value(&raw[i]);
+        let (flag, inline) = split_eq_flag(&token);
+        if !flag.starts_with('-') && looks_like_kron1(flag) {
+            reward = Some(parse_kron1_arg(flag)?);
+            i += 1;
+            continue;
+        }
+        match flag {
             "--phone" => phone = true,
+            "--mine" => {
+                if let Some(v) = inline {
+                    if !sanitize_cli_value(v).is_empty() {
+                        reward = Some(parse_kron1_arg(v)?);
+                    }
+                }
+            }
             "--node" | "--bootstrap" => {
-                i += 1;
-                let v = raw
-                    .get(i)
-                    .ok_or_else(|| String::from("--node requires IP:PORT"))?;
+                let v = take_cli_value(inline, &raw, &mut i, "--node")?;
                 node = Some(
                     v.parse::<SocketAddr>()
                         .map_err(|_| format!("invalid --node '{v}'"))?,
                 );
             }
             "--reward-address" | "--miner-address" => {
-                i += 1;
-                let v = raw
-                    .get(i)
-                    .ok_or_else(|| String::from("--reward-address requires kron1..."))?;
-                reward = Some(
-                    KronAddress::parse(v)
-                        .map_err(|e| format!("invalid Bech32 KRON address '{v}': {e}"))?,
-                );
+                let v = take_cli_value(inline, &raw, &mut i, "--reward-address")
+                    .map_err(|_| String::from("--reward-address requires kron1..."))?;
+                if v.starts_with('-') && !looks_like_kron1(&v) {
+                    return Err(String::from("--reward-address requires kron1..."));
+                }
+                reward = Some(parse_kron1_arg(&v)?);
             }
             "--data-dir" => {
-                i += 1;
-                let v = raw
-                    .get(i)
-                    .ok_or_else(|| String::from("--data-dir requires a path"))?;
-                data_dir = Some(PathBuf::from(v));
+                data_dir = Some(PathBuf::from(take_cli_value(
+                    inline,
+                    &raw,
+                    &mut i,
+                    "--data-dir",
+                )?));
             }
-            other => return Err(format!("unknown argument: {other}")),
+            other => return Err(unknown_argument(other, PHONE_MINER_FLAGS)),
         }
         i += 1;
     }

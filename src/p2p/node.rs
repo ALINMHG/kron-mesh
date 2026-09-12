@@ -9,12 +9,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::listen::bind_tcp_reuse;
 use crate::p2p::error::NetworkError;
 use crate::p2p::frame::{KIND_INV, KIND_PAYLOAD, KIND_PING, KIND_PONG, KIND_WANT};
 use crate::p2p::gossip::{GossipEngine, GossipInventory, GossipPayload, GossipWant};
 use crate::p2p::handshake::{perform_secure_handshake, HandshakeConfig};
 use crate::p2p::mesh::{serve_mesh_session, MeshGraph, MESH_MAGIC};
 use crate::p2p::noise::NoiseSession;
+use crate::p2p::overlay::NodeOverlayId;
 use crate::p2p::peer::{PeerInfo, PeerRole};
 use crate::p2p::routing::RoutingTable;
 use crate::types::message::MeshMessage;
@@ -32,6 +34,7 @@ enum SessionCmd {
 
 pub struct P2pNode {
     pub local_id: Address,
+    pub overlay_id: NodeOverlayId,
     pub addr: std::net::SocketAddr,
     pub role: PeerRole,
     hs: HandshakeConfig,
@@ -51,10 +54,11 @@ impl P2pNode {
 
     /// Bind a specific listen address (CLI `--port`).
     pub fn bind_on(hs: HandshakeConfig, bind_addr: std::net::SocketAddr) -> Result<Self, NetworkError> {
-        let listener = TcpListener::bind(bind_addr)?;
+        let listener = bind_tcp_reuse(bind_addr)?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
         let local_id = hs.peer_id();
+        let overlay_id = hs.overlay_id();
         let role = hs.role;
         let table = Arc::new(Mutex::new(RoutingTable::new(local_id, role)));
         let gossip = Arc::new(Mutex::new(GossipEngine::for_role(role)));
@@ -65,6 +69,7 @@ impl P2pNode {
 
         let node = Self {
             local_id,
+            overlay_id,
             addr,
             role,
             hs: hs.clone(),
@@ -91,7 +96,7 @@ impl P2pNode {
     }
 
     pub fn connect(&self, addr: std::net::SocketAddr) -> Result<PeerInfo, NetworkError> {
-        let stream = TcpStream::connect(addr)?;
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         let mut session = match NoiseSession::handshake(stream, true) {
             Ok(s) => s,
             Err(e) => return Err(e),
@@ -161,6 +166,13 @@ impl P2pNode {
         self.live_peers().len()
     }
 
+    pub fn has_overlay(&self, id: &NodeOverlayId) -> bool {
+        match self.table.lock() {
+            Ok(t) => t.contains_overlay(id),
+            Err(poisoned) => poisoned.into_inner().contains_overlay(id),
+        }
+    }
+
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -184,43 +196,22 @@ fn accept_loop(
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                let mut peek = [0u8; 4];
-                match stream.peek(&mut peek) {
-                    Ok(4) if peek == *MESH_MAGIC => {
-                        if let Some(g) = graph.lock().unwrap().clone() {
-                            thread::Builder::new()
-                                .name("kron-mesh-session".into())
-                                .spawn(move || serve_mesh_session(stream, g))
-                                .ok();
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-                let mut session = match NoiseSession::handshake(stream, false) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let mut cfg = hs.clone();
-                cfg.initiator = false;
-                match perform_secure_handshake(&mut session, &cfg) {
-                    Ok(info) => {
-                        let _ = table.lock().unwrap().insert(info.peer.clone());
-                        spawn_session(
-                            session,
-                            info.peer.id,
-                            stop.clone(),
-                            gossip.clone(),
-                            sessions.clone(),
-                            delivered.clone(),
-                        );
-                    }
-                    Err(_) => {
-                        session.shutdown();
-                    }
-                }
+            Ok((stream, from)) => {
+                let hs = hs.clone();
+                let table = table.clone();
+                let gossip = gossip.clone();
+                let sessions = sessions.clone();
+                let delivered = delivered.clone();
+                let graph = graph.clone();
+                let stop = stop.clone();
+                thread::Builder::new()
+                    .name("p2p-inbound".into())
+                    .spawn(move || {
+                        handle_inbound(
+                            stream, from, hs, stop, table, gossip, sessions, delivered, graph,
+                        )
+                    })
+                    .ok();
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -228,6 +219,90 @@ fn accept_loop(
             Err(_) => thread::sleep(Duration::from_millis(50)),
         }
     }
+}
+
+fn handle_inbound(
+    stream: TcpStream,
+    from: std::net::SocketAddr,
+    hs: HandshakeConfig,
+    stop: Arc<AtomicBool>,
+    table: Arc<Mutex<RoutingTable>>,
+    gossip: Arc<Mutex<GossipEngine>>,
+    sessions: Arc<Mutex<HashMap<Address, Sender<SessionCmd>>>>,
+    delivered: Arc<Mutex<Vec<(Address, MeshMessage)>>>,
+    graph: Arc<Mutex<Option<Arc<dyn MeshGraph>>>>,
+) {
+    let _ = stream.set_nonblocking(false);
+    if inbound_is_mesh(&stream) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let graph_ref = loop {
+            if let Some(g) = graph.lock().unwrap().clone() {
+                break Some(g);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        match graph_ref {
+            Some(g) => {
+                crate::kron_log("KRON P2P", format!("inbound kron-mesh/1 from {from}"));
+                serve_mesh_session(stream, g);
+            }
+            None => {
+                crate::kron_elog(
+                    "KRON P2P",
+                    format!("inbound kron-mesh/1 from {from} dropped: hub graph not ready"),
+                );
+            }
+        }
+        return;
+    }
+    let mut session = match NoiseSession::handshake(stream, false) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut cfg = hs;
+    cfg.initiator = false;
+    match perform_secure_handshake(&mut session, &cfg) {
+        Ok(info) => {
+            let _ = table.lock().unwrap().insert(info.peer.clone());
+            spawn_session(
+                session,
+                info.peer.id,
+                stop,
+                gossip,
+                sessions,
+                delivered,
+            );
+        }
+        Err(_) => {
+            session.shutdown();
+        }
+    }
+}
+
+/// Wait until four bytes are peekable so a slow `kron-mesh/1` hello is not
+/// mistaken for Noise (`peek` may return 1–3 bytes without blocking).
+fn inbound_is_mesh(stream: &TcpStream) -> bool {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut got = [0u8; 4];
+    while std::time::Instant::now() < deadline {
+        match stream.peek(&mut got) {
+            Ok(n) if n >= 4 => return got == *MESH_MAGIC,
+            Ok(_) => thread::sleep(Duration::from_millis(10)),
+            Err(e)
+                if e.kind() == ErrorKind::WouldBlock
+                    || e.kind() == ErrorKind::TimedOut
+                    || e.kind() == ErrorKind::Interrupted =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn spawn_session(

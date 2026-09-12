@@ -1,33 +1,103 @@
 //! Tiny std HTTP/1.1 explorer (no axum / tokio). Bound from the gateway CLI.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::economics::{HARD_CAP, UNITS_PER_COIN};
+use crate::economics::{FIXED_TRANSACTION_FEE, HARD_CAP, UNITS_PER_COIN};
+use crate::kron::{DEFAULT_BOOTSTRAP, DEFAULT_EXPLORER_URL};
 use crate::explorer::api::ExplorerApi;
 use crate::explorer::indexer::{IndexedTransaction, IndexedVertex, NetworkStats, WalletSnapshot};
 use crate::explorer::get_kron_asset_metadata;
+use crate::listen::{
+    bind_tcp_reuse, detect_lan_ipv4, format_explorer_open_line, format_public_explorer_url,
+    is_addr_in_use, log_port_in_use,
+};
+use crate::{kron_elog, kron_log};
 
 const UI: &str = include_str!("ui.html");
 
-/// Bind `127.0.0.1:port` and serve the explorer until `stop` is set.
+/// Bind `0.0.0.0:port` (LAN) and serve the explorer until `stop` is set.
 pub fn start_explorer_http(
     api: Arc<Mutex<ExplorerApi>>,
     port: u16,
     stop: Arc<AtomicBool>,
 ) -> Result<SocketAddr, std::io::Error> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(addr)?;
+    start_explorer_http_advertised(api, port, stop, None)
+}
+
+/// Same as [`start_explorer_http`], but print `http://<advertised>:port` for a VPS hub.
+pub fn start_explorer_http_advertised(
+    api: Arc<Mutex<ExplorerApi>>,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    advertised: Option<Ipv4Addr>,
+) -> Result<SocketAddr, std::io::Error> {
+    start_explorer_http_on_with(
+        api,
+        SocketAddr::from(([0, 0, 0, 0], port)),
+        stop,
+        advertised,
+    )
+}
+
+/// Bind an explicit listen address (tests may use `127.0.0.1:0`).
+pub fn start_explorer_http_on(
+    api: Arc<Mutex<ExplorerApi>>,
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+) -> Result<SocketAddr, std::io::Error> {
+    start_explorer_http_on_with(api, addr, stop, None)
+}
+
+fn start_explorer_http_on_with(
+    api: Arc<Mutex<ExplorerApi>>,
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    advertised: Option<Ipv4Addr>,
+) -> Result<SocketAddr, std::io::Error> {
+    let listener = match bind_tcp_reuse(addr) {
+        Ok(listener) => listener,
+        Err(e) if is_addr_in_use(&e) => {
+            log_port_in_use(
+                "KRON EXPLORER",
+                "Explorer",
+                addr.port(),
+                "--explorer-port",
+                Some(&e),
+            );
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
     listener.set_nonblocking(true)?;
     let bound = listener.local_addr()?;
     thread::Builder::new()
         .name("kron-explorer-http".into())
         .spawn(move || accept_loop(listener, api, stop))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    // Bind-all is 0.0.0.0. Print that listen address, then a URL a browser can open
+    // (public / LAN IPv4) — never http://0.0.0.0.
+    if bound.ip().is_unspecified() {
+        kron_log(
+            "KRON EXPLORER",
+            format!("listening 0.0.0.0:{}", bound.port()),
+        );
+    }
+    let url = if let Some(ip) = advertised {
+        format_public_explorer_url(ip, bound.port())
+    } else {
+        let lan = match bound.ip() {
+            ip if ip.is_unspecified() => detect_lan_ipv4(),
+            std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+            _ => detect_lan_ipv4(),
+        };
+        format_explorer_open_line(lan, bound.port())
+    };
+    kron_log("KRON EXPLORER", url);
     Ok(bound)
 }
 
@@ -38,14 +108,17 @@ fn accept_loop(listener: TcpListener, api: Arc<Mutex<ExplorerApi>>, stop: Arc<At
                 let api = api.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_client(stream, &api) {
-                        eprintln!("[KRON EXPLORER] request error: {e}");
+                        kron_elog("KRON EXPLORER", format!("request error: {e}"));
                     }
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => thread::sleep(Duration::from_millis(50)),
+            Err(e) => {
+                kron_elog("KRON EXPLORER", format!("accept: {e}"));
+                thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }
@@ -197,16 +270,19 @@ fn json_str(s: &str) -> String {
 fn metadata_json() -> String {
     let meta = get_kron_asset_metadata();
     format!(
-        "{{\"name\":{},\"ticker\":{},\"decimals\":{}}}",
-        json_str(meta.name),
+        "{{\"name\":{},\"ticker\":{},\"decimals\":{},\"kind\":\"DAG\",\"hub\":{},\"explorer_url\":{},\"fee_kron\":{},\"miner_share_percent\":80,\"relay_share_percent\":20}}",
+        json_str("KRON Mesh"),
         json_str(meta.ticker),
-        meta.decimals
+        meta.decimals,
+        json_str(DEFAULT_BOOTSTRAP),
+        json_str(DEFAULT_EXPLORER_URL),
+        json_str(&format_units(FIXED_TRANSACTION_FEE))
     )
 }
 
 fn stats_json(s: &NetworkStats) -> String {
     format!(
-        "{{\"vertex_count\":{},\"tip_count\":{},\"dag_tx_count\":{},\"tx_count\":{},\"circulating_supply\":{},\"circulating_kron\":{},\"hard_cap\":{},\"hard_cap_kron\":{},\"txs_remaining_until_halving\":{}}}",
+        "{{\"vertex_count\":{},\"tip_count\":{},\"dag_tx_count\":{},\"tx_count\":{},\"circulating_supply\":{},\"circulating_kron\":{},\"hard_cap\":{},\"hard_cap_kron\":{},\"txs_remaining_until_halving\":{},\"hub\":{},\"explorer_url\":{},\"mesh_id_hint\":\"fd00::/8 overlay\",\"fee_kron\":{},\"miner_share_percent\":80,\"relay_share_percent\":20}}",
         s.vertex_count,
         s.tip_count,
         s.dag_tx_count,
@@ -215,7 +291,10 @@ fn stats_json(s: &NetworkStats) -> String {
         json_str(&format_units(s.circulating_supply)),
         s.hard_cap,
         json_str(&format_units(HARD_CAP)),
-        s.txs_remaining_until_halving
+        s.txs_remaining_until_halving,
+        json_str(DEFAULT_BOOTSTRAP),
+        json_str(DEFAULT_EXPLORER_URL),
+        json_str(&format_units(FIXED_TRANSACTION_FEE))
     )
 }
 

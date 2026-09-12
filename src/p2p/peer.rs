@@ -6,6 +6,7 @@ use std::time::Instant;
 use crate::anti_bot::DeviceScore;
 use crate::crypto::lattice::LatticePublicKey;
 use crate::anti_bot::profile::DeviceClass;
+use crate::p2p::overlay::NodeOverlayId;
 use crate::types::Address;
 
 /// Gateway (PC) stays in a separate overlay from phones so a phone cannot
@@ -46,6 +47,8 @@ pub enum ConnectionState {
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub id: Address,
+    /// Mesh ID (ULA). Routing looks up this, not the LAN `192.168` address.
+    pub overlay_id: NodeOverlayId,
     pub public_key: LatticePublicKey,
     pub addr: SocketAddr,
     pub role: PeerRole,
