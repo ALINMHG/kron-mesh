@@ -1,0 +1,15 @@
+[package]
+name = "kron-wallet"
+version = "0.1.0"
+edition = "2021"
+description = "Native desktop wallet for KRON Network"
+publish = false
+
+[dependencies]
+new-blockchain = { path = ".." }
+eframe = { version = "0.31.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+bip39 = { version = "2.2", default-features = false, features = ["std"] }
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

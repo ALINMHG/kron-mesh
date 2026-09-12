@@ -1,0 +1,34 @@
+[package]
+name = "new-blockchain"
+version = "0.1.0"
+edition = "2021"
+description = "KRON Mesh — asynchronous mobile DAG ledger"
+default-run = "kron-node"
+license = "MIT"
+readme = "README.md"
+
+[workspace]
+members = ["kron-wallet"]
+resolver = "2"
+
+[[bin]]
+name = "kron-node"
+path = "src/bin/kron-node.rs"
+
+[[bin]]
+name = "kron-phone-miner"
+path = "src/bin/kron-phone-miner.rs"
+
+[[bin]]
+name = "kron-phone"
+path = "src/bin/kron-phone.rs"
+
+[dependencies]
+bip39 = { version = "2.2", default-features = false, features = ["std"] }
+fips204 = "0.4"
+hex = "0.4"
+rand = "0.8"
+serde_json = "1"
+sha2 = "0.10"
+snow = "0.9"
+thiserror = "1"

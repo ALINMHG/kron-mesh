@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>KRON Mesh Explorer</title>
+<style>
+  :root {
+    --bg: #0a0a0c;
+    --panel: #12141a;
+    --line: #1c2430;
+    --accent: #00e5ff;
+    --accent-dim: #007a88;
+    --text: #e8f6ff;
+    --muted: #7a90a4;
+    --warn: #ffb020;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif; }
+  header {
+    border-bottom: 1px solid var(--line);
+    padding: 22px 28px 18px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .glyph {
+    width: 40px; height: 40px; flex: 0 0 40px;
+  }
+  h1 { margin: 0; font-size: 22px; letter-spacing: 0.08em; color: var(--accent); }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  main { padding: 22px 28px 48px; max-width: 1100px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+  }
+  .card label { display: block; color: var(--muted); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .card .v { margin-top: 6px; font-size: 20px; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .card .s { margin-top: 4px; color: var(--muted); font-size: 12px; }
+  h2 { margin: 28px 0 10px; font-size: 15px; color: var(--accent); letter-spacing: 0.06em; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  input[type=text] {
+    flex: 1; min-width: 220px; background: #0d1016; border: 1px solid var(--line);
+    color: var(--text); padding: 10px 12px; border-radius: 8px; font-family: ui-monospace, Consolas, monospace;
+  }
+  button {
+    background: transparent; color: var(--accent); border: 1px solid var(--accent);
+    padding: 10px 14px; border-radius: 8px; cursor: pointer;
+  }
+  button:hover { background: #00e5ff18; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
+  td.mono, .mono { font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+  .fee { color: var(--accent); }
+  .empty { color: var(--muted); padding: 12px 0; }
+  #lookup { white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace;
+    background: #0d1016; border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 4em; }
+</style>
+</head>
+<body>
+<header>
+  <svg class="glyph" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect width="32" height="32" fill="#0a0a0c"/>
+    <path d="M7 3 L16 16 L7 29" stroke="#00e5ff" stroke-width="2.2"/>
+    <path d="M16 16 L26 4" stroke="#00e5ff" stroke-width="2.2"/>
+    <path d="M16 16 L26 28" stroke="#00e5ff" stroke-width="2.2"/>
+  </svg>
+  <div>
+    <h1 id="brand-name">KRON Mesh</h1>
+    <p>Mesh DAG · tips · vertices · supply · fee 0.001 <span id="ticker">KRON</span> · 80% miner phone / 20% relays</p>
+  </div>
+</header>
+<main>
+  <div class="stats">
+    <div class="card"><label>Vertices</label><div class="v" id="st-vertices">—</div></div>
+    <div class="card"><label>Tips</label><div class="v" id="st-tips">—</div></div>
+    <div class="card"><label>Circulating</label><div class="v" id="st-supply">—</div><div class="s" id="st-cap"></div></div>
+    <div class="card"><label>Confirmed txs</label><div class="v" id="st-txs">—</div></div>
+    <div class="card"><label>Txs to halving</label><div class="v" id="st-halving">—</div></div>
+  </div>
+
+  <h2>Lookup</h2>
+  <div class="row">
+    <input id="q-hash" type="text" placeholder="Vertex hash (64 hex)"/>
+    <button type="button" id="btn-hash">Find vertex</button>
+    <input id="q-wallet" type="text" placeholder="kron1… wallet"/>
+    <button type="button" id="btn-wallet">History</button>
+  </div>
+  <div id="lookup" class="empty">Search a vertex hash or kron1 address.</div>
+
+  <h2>Recent tips / vertices</h2>
+  <div id="vertices" class="empty">Loading…</div>
+  <h2>Recent transactions</h2>
+  <div id="txs" class="empty">Loading…</div>
+</main>
+<script>
+async function j(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(r.status + " " + r.statusText);
+  return r.json();
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+function feeCell(tx) {
+  const fs = tx.fee_split || {};
+  return '<span class="fee">80% miner / 20% relays</span><br/>'
+    + '<span class="mono">' + esc(fs.miner_address || "") + '</span>';
+}
+function txTable(rows) {
+  if (!rows || !rows.length) return '<div class="empty">No vertices yet.</div>';
+  let h = '<table><thead><tr><th>Hash</th><th>From</th><th>To</th><th>Amount</th><th>Fee split</th><th>Weight</th></tr></thead><tbody>';
+  for (const tx of rows) {
+    h += '<tr><td class="mono">' + esc(tx.hash) + '</td><td class="mono">' + esc(tx.from)
+      + '</td><td class="mono">' + esc(tx.to) + '</td><td>' + esc(tx.amount_kron) + ' KRON</td><td>'
+      + feeCell(tx) + '</td><td>' + esc(tx.weight) + (tx.is_tip ? ' tip' : '') + '</td></tr>';
+  }
+  return h + '</tbody></table>';
+}
+function vertexTable(rows) {
+  if (!rows || !rows.length) return '<div class="empty">No tips yet.</div>';
+  let h = '<table><thead><tr><th>Hash</th><th>Subsidy</th><th>Miner 80%</th><th>Relays 20%</th></tr></thead><tbody>';
+  for (const v of rows) {
+    h += '<tr><td class="mono">' + esc(v.hash) + '</td><td>'
+      + esc(v.subsidy_kron) + '</td><td>'
+      + esc(v.miner_share_kron) + '<br/><span class="mono">' + esc(v.miner || '') + '</span></td><td>'
+      + esc(v.relay_share_kron) + '</td></tr>';
+  }
+  return h + '</tbody></table>';
+}
+async function refresh() {
+  try {
+    const [meta, stats, verts, txs] = await Promise.all([
+      j('/api/metadata'), j('/api/stats'), j('/api/vertices'), j('/api/txs')
+    ]);
+    document.getElementById('brand-name').textContent = meta.name || 'KRON Mesh';
+    document.getElementById('ticker').textContent = meta.ticker || 'KRON';
+    document.title = (meta.ticker || 'KRON') + ' Mesh Explorer';
+    document.getElementById('st-vertices').textContent = stats.vertex_count;
+    document.getElementById('st-tips').textContent = stats.tip_count;
+    document.getElementById('st-supply').textContent = stats.circulating_kron + ' ' + (meta.ticker || 'KRON');
+    document.getElementById('st-cap').textContent = 'cap ' + stats.hard_cap_kron + ' ' + (meta.ticker || 'KRON');
+    document.getElementById('st-txs').textContent = stats.dag_tx_count;
+    document.getElementById('st-halving').textContent = stats.txs_remaining_until_halving;
+    document.getElementById('vertices').innerHTML = vertexTable(verts);
+    document.getElementById('txs').innerHTML = txTable(txs);
+  } catch (e) {
+    document.getElementById('vertices').textContent = 'Explorer offline: ' + e.message;
+  }
+}
+document.getElementById('btn-hash').onclick = async () => {
+  const q = document.getElementById('q-hash').value.trim();
+  const el = document.getElementById('lookup');
+  if (!q) { el.textContent = 'Enter a 64-hex vertex hash.'; return; }
+  try {
+    const tx = await j('/api/tx/' + encodeURIComponent(q));
+    el.className = '';
+    el.textContent = JSON.stringify(tx, null, 2);
+  } catch (e) { el.textContent = 'Not found: ' + e.message; }
+};
+document.getElementById('btn-wallet').onclick = async () => {
+  const q = document.getElementById('q-wallet').value.trim();
+  const el = document.getElementById('lookup');
+  if (!q) { el.textContent = 'Enter a kron1 address.'; return; }
+  try {
+    const hist = await j('/api/wallet/' + encodeURIComponent(q));
+    el.className = '';
+    const rows = Array.isArray(hist) ? hist : (hist.txs || []);
+    const bal = hist && hist.balance_kron ? hist.balance_kron + ' KRON' : '';
+    el.innerHTML = (bal ? '<div class="card" style="margin-bottom:10px"><label>Balance</label><div class="v">' + esc(bal) + '</div></div>' : '') + txTable(rows);
+  } catch (e) { el.textContent = 'Lookup failed: ' + e.message; }
+};
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>

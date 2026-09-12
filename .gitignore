@@ -1,0 +1,25 @@
+/target
+**/*.rs.bk
+.idea
+.vscode
+
+# Secrets and local identity — never commit
+.env
+.env.*
+wallet.json
+wallet.json.bak
+wallet.seed
+wallet.mnemonic
+identity.seed
+mnemonic.shown
+*.mnemonic
+*.seed
+
+# Runtime data dirs created by the binaries
+/kron-phone/
+/kron-phone-miner/
+/kron-miner/
+/gateway-*/
+
+Thumbs.db
+.DS_Store
